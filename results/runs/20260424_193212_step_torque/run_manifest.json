@@ -1,0 +1,32 @@
+{
+  "run_label": "20260424_193212_step_torque",
+  "mode": "step_torque",
+  "start_time": "2026-04-24T11:32:12+00:00",
+  "end_time": "2026-04-24T11:32:18+00:00",
+  "group_count": 1,
+  "motor_order": [
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7
+  ],
+  "capture_files": [
+    "/home/luwen/桌面/参数4.8_摩擦力辨识/results/runs/20260424_193212_step_torque/group_01/motor_01/capture.npz"
+  ],
+  "identification_files": [],
+  "dynamic_identification_files": [],
+  "summary_files": {},
+  "rerun_recording_path": "/home/luwen/桌面/参数4.8_摩擦力辨识/results/runs/20260424_193212_step_torque/step_torque.rrd",
+  "config_path": "/home/luwen/桌面/参数4.8_摩擦力辨识/friction_identification_core/default.yaml",
+  "abort_event": {
+    "reason": "sync_timeout",
+    "stage": "step_torque",
+    "motor_id": 2,
+    "group_index": 1,
+    "round_index": 2,
+    "phase_name": "sync_wait"
+  }
+}
