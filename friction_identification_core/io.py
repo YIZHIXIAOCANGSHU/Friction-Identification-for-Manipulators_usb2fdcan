@@ -2,29 +2,21 @@ from __future__ import annotations
 
 import struct
 from dataclasses import dataclass
-from typing import Protocol
+from typing import Literal, Protocol
 
 import numpy as np
 
-from friction_identification_core.config import SerialConfig
+from friction_identification_core.runtime_config import Config
+from send import damiao as send_damiao
 
 
-RECV_FRAME_HEAD = 0xA5
-RECV_FRAME_FORMAT = "<BBBffff"
-RECV_FRAME_STRUCT = struct.Struct(RECV_FRAME_FORMAT)
+SemanticMode = Literal["mit_torque", "mit_velocity", "velocity_mode"]
+
+RECV_FRAME_HEAD = send_damiao.SERIALIZED_FEEDBACK_HEAD
+RECV_FRAME_FORMAT = send_damiao.SERIALIZED_FEEDBACK_FORMAT
+RECV_FRAME_STRUCT = send_damiao.SERIALIZED_FEEDBACK_STRUCT
 RECV_FRAME_SIZE = RECV_FRAME_STRUCT.size
-
-COMMAND_FRAME_HEAD = b"\xAA\x55"
-COMMAND_FRAME_TAIL = b"\x55\xAA"
-COMMAND_PAYLOAD_STRUCT = struct.Struct("<7f")
-COMMAND_FRAME_SIZE = len(COMMAND_FRAME_HEAD) + COMMAND_PAYLOAD_STRUCT.size + 1 + len(COMMAND_FRAME_TAIL)
-
-
-def calculate_xor_checksum(data: bytes) -> int:
-    checksum = 0
-    for value in data:
-        checksum ^= int(value)
-    return checksum & 0xFF
+VALID_FEEDBACK_STATE_CODES = send_damiao.VALID_FEEDBACK_STATE_CODES
 
 
 @dataclass(frozen=True)
@@ -37,7 +29,7 @@ class FeedbackFrame:
     mos_temperature: float
 
 
-class SerialFrameParser:
+class FeedbackFrameParser:
     def __init__(self, *, max_motor_id: int = 7) -> None:
         self._buffer = bytearray()
         self._max_motor_id = max(int(max_motor_id), 1)
@@ -94,75 +86,44 @@ class SerialFrameParser:
             )
 
 
-class MotorSequenceChecker:
-    def __init__(self, motor_ids: tuple[int, ...]) -> None:
-        if not motor_ids:
-            raise ValueError("motor_ids must not be empty.")
-        self._motor_ids = tuple(int(motor_id) for motor_id in motor_ids)
-        self._expected_motor_id: int | None = None
-        self.error_count = 0
-
-    def reset(self) -> None:
-        self._expected_motor_id = None
-        self.error_count = 0
-
-    def _next_motor_id(self, current_motor_id: int) -> int:
-        index = self._motor_ids.index(int(current_motor_id))
-        return self._motor_ids[(index + 1) % len(self._motor_ids)]
-
-    def observe(self, motor_id: int) -> bool:
-        motor_id = int(motor_id)
-        if motor_id not in self._motor_ids:
-            self.error_count += 1
-            self._expected_motor_id = None
-            return False
-        if self._expected_motor_id is None:
-            self._expected_motor_id = self._next_motor_id(motor_id)
-            return True
-
-        ok = motor_id == self._expected_motor_id
-        if not ok:
-            self.error_count += 1
-        self._expected_motor_id = self._next_motor_id(motor_id)
-        return ok
-
-
-class SingleMotorCommandAdapter:
-    def __init__(self, *, motor_count: int = 7, torque_limits: np.ndarray | None = None) -> None:
-        if int(motor_count) != 7:
-            raise ValueError("The current UART adapter expects exactly 7 motor slots.")
-        self._motor_count = int(motor_count)
-        if torque_limits is None:
-            limits = np.full(self._motor_count, np.inf, dtype=np.float64)
-        else:
-            limits = np.asarray(torque_limits, dtype=np.float64).reshape(-1)
-            if limits.size != self._motor_count:
-                raise ValueError(f"torque_limits must contain exactly {self._motor_count} values.")
-        self._torque_limits = limits.astype(np.float64, copy=True)
-
-    def limit_command(self, motor_id: int, command: float) -> float:
-        motor_id = int(motor_id)
-        if not 1 <= motor_id <= self._motor_count:
-            raise ValueError(f"motor_id must be within [1, {self._motor_count}].")
-        torque_limit = float(self._torque_limits[motor_id - 1])
-        return float(np.clip(float(command), -torque_limit, torque_limit))
-
-    def pack(self, motor_id: int, command: float) -> bytes:
-        motor_id = int(motor_id)
-        if not 1 <= motor_id <= self._motor_count:
-            raise ValueError(f"motor_id must be within [1, {self._motor_count}].")
-        payload = np.zeros(self._motor_count, dtype=np.float32)
-        payload[motor_id - 1] = np.float32(self.limit_command(motor_id, command))
-        payload_bytes = COMMAND_PAYLOAD_STRUCT.pack(*[float(value) for value in payload])
-        checksum = calculate_xor_checksum(COMMAND_FRAME_HEAD + payload_bytes)
-        return COMMAND_FRAME_HEAD + payload_bytes + bytes((checksum,)) + COMMAND_FRAME_TAIL
-
-
-class SerialTransport(Protocol):
+class CommandTransport(Protocol):
     def read(self, size: int) -> bytes:
         ...
 
-    def write(self, payload: bytes) -> int:
+    def pop_feedback_frame(self) -> FeedbackFrame | None:
+        ...
+
+    def send_mit_torque(self, motor_id: int, torque: float) -> bytes:
+        ...
+
+    def send_mit_velocity(
+        self,
+        motor_id: int,
+        velocity: float,
+        kd: float,
+        *,
+        kp: float = 0.0,
+        torque_ff: float = 0.0,
+        position: float = 0.0,
+    ) -> bytes:
+        ...
+
+    def send_velocity_mode(self, motor_id: int, velocity: float) -> bytes:
+        ...
+
+    def send_zero_command(self, motor_id: int, semantic_mode: SemanticMode) -> bytes:
+        ...
+
+    def limit_torque_command(self, motor_id: int, torque: float) -> float:
+        ...
+
+    def enable_motor(self, motor_id: int) -> bytes:
+        ...
+
+    def disable_motor(self, motor_id: int) -> bytes:
+        ...
+
+    def clear_error(self, motor_id: int) -> bytes:
         ...
 
     def reset_input_buffer(self) -> None:
@@ -172,49 +133,22 @@ class SerialTransport(Protocol):
         ...
 
 
-class PySerialTransport:
-    def __init__(self, config: SerialConfig) -> None:
-        import serial
-
-        self._serial = serial.Serial(
-            port=config.port,
-            baudrate=config.baudrate,
-            timeout=float(config.read_timeout),
-            write_timeout=float(config.write_timeout),
-        )
-
-    def read(self, size: int) -> bytes:
-        return bytes(self._serial.read(max(int(size), 1)))
-
-    def write(self, payload: bytes) -> int:
-        return int(self._serial.write(payload))
-
-    def reset_input_buffer(self) -> None:
-        if hasattr(self._serial, "reset_input_buffer"):
-            self._serial.reset_input_buffer()
-
-    def close(self) -> None:
-        self._serial.close()
+DamiaoSocketCanTransport = send_damiao.DamiaoSocketCanTransport
 
 
-def open_serial_transport(config: SerialConfig) -> SerialTransport:
-    return PySerialTransport(config)
+def open_transport(config: Config) -> CommandTransport:
+    return DamiaoSocketCanTransport(config)
 
 
 __all__ = [
-    "COMMAND_FRAME_HEAD",
-    "COMMAND_FRAME_SIZE",
-    "COMMAND_FRAME_TAIL",
-    "COMMAND_PAYLOAD_STRUCT",
+    "CommandTransport",
+    "DamiaoSocketCanTransport",
     "FeedbackFrame",
-    "MotorSequenceChecker",
-    "PySerialTransport",
+    "FeedbackFrameParser",
     "RECV_FRAME_HEAD",
     "RECV_FRAME_SIZE",
     "RECV_FRAME_STRUCT",
-    "SerialFrameParser",
-    "SerialTransport",
-    "SingleMotorCommandAdapter",
-    "calculate_xor_checksum",
-    "open_serial_transport",
+    "SemanticMode",
+    "VALID_FEEDBACK_STATE_CODES",
+    "open_transport",
 ]

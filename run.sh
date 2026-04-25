@@ -16,9 +16,8 @@ Usage:
 
 Notes:
   - `./run.sh` 会启动交互式数字向导。
-  - `./run.sh step --motors 1,3,4` 这类旧式非交互调用已不再支持。
-  - 自动化或脚本化调用请改用：
-      python3 -m friction_identification_core --mode step --config friction_identification_core/default.yaml
+  - 自动化或脚本化调用请直接使用：
+      python3 -m friction_identification_core --mode identify-all --config friction_identification_core/default.yaml
 EOF
 }
 
@@ -26,7 +25,7 @@ legacy_usage_error() {
     cat >&2 <<'EOF'
 [ERROR] `run.sh` 现在只支持交互式启动。
 请改用 `./run.sh` 进入菜单，或直接使用：
-python3 -m friction_identification_core --mode step --config friction_identification_core/default.yaml ...
+python3 -m friction_identification_core --mode identify-all --config friction_identification_core/default.yaml ...
 EOF
     exit 1
 }
@@ -95,30 +94,52 @@ if [[ $# -gt 0 ]]; then
     legacy_usage_error
 fi
 
-echo "欢迎使用逐电机阶跃力矩扫描交互式启动向导。"
+echo "欢迎使用 MIT identify-all 交互式启动向导。"
 echo "默认配置路径: ${DEFAULT_CONFIG_FILE}"
-echo "程序会从 0 开始，每 1s 增加 0.1Nm，速度超过 10rad/s 就切到下一个电机。"
+echo "正式模式：identify-all（辨识） / compensation（在线补偿）。"
 
 print_menu "启动菜单" \
-    "1. step torque sweep" \
+    "1. identify-all" \
+    "2. compensation" \
     "0. exit"
 mode_choice=""
-read_menu_choice mode_choice '请选择: ' 0 1
+read_menu_choice mode_choice '请选择: ' 0 1 2
 if [[ "$mode_choice" == "0" ]]; then
     echo "已退出。"
     exit 0
 fi
-MODE="step"
+MODE="identify-all"
+if [[ "$mode_choice" == "2" ]]; then
+    MODE="compensation"
+fi
 CONFIG_PATH="$DEFAULT_CONFIG_FILE"
 
-print_menu "电机菜单" \
-    "1. all" \
-    "2. 输入 motor id 列表，例如 1,3,4"
-motors_choice=""
-read_menu_choice motors_choice '请选择电机: ' 1 2
-MOTORS="all"
-if [[ "$motors_choice" == "2" ]]; then
-    read_custom_motors MOTORS
+read_single_motor() {
+    local result_var="$1"
+    local motor_input
+    while true; do
+        printf '请输入单个 motor id（例如 3）: '
+        IFS= read -r motor_input || exit 1
+        if [[ "$motor_input" =~ ^[0-9]+$ ]]; then
+            printf -v "$result_var" '%s' "$motor_input"
+            return 0
+        fi
+        echo "输入无效，请输入单个整数 motor id。"
+    done
+}
+
+if [[ "$MODE" == "identify-all" ]]; then
+    print_menu "电机菜单" \
+        "1. all" \
+        "2. 输入 motor id 列表，例如 1,3,4"
+    motors_choice=""
+    read_menu_choice motors_choice '请选择电机: ' 1 2
+    MOTORS="all"
+    if [[ "$motors_choice" == "2" ]]; then
+        read_custom_motors MOTORS
+    fi
+else
+    read_single_motor MOTORS
 fi
 OUTPUT_DIR="$DEFAULT_OUTPUT_DIR"
 

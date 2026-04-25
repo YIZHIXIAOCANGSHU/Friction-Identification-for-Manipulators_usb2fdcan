@@ -10,27 +10,46 @@ motors:
     - "motor_07"
   enabled: [1, 2, 3, 4, 5, 6, 7]
 
-serial:
-  port: "/dev/ttyUSB0"
-  baudrate: 115200
+transport:
+  interface: "can0"
+  nominal_bitrate: 1000000
+  data_bitrate: 5000000
+  configure_interface: false
+  force_fd: true
   read_timeout: 0.02
-  write_timeout: 0.02
   read_chunk_size: 256
   flush_input_before_round: true
   sync_timeout: 2.0
-  sync_cycles_required: 3
+  motor_can_ids: [0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07]
+  motor_mst_ids: [0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17]
+  motor_types: ["DM8009", "DM8009", "DM4340", "DM4340", "DM4310", "DM4310", "DM4310"]
 
-control:
-  max_torque: [40.0, 40.0, 27.0, 27.0, 7.0, 7.0, 9.0]
+safety:
+  hard_speed_abort_abs: 10.0
+  moving_velocity_threshold: 0.2
+  moving_hold_ms: 50
+  post_abort_disable_delay_ms: 80
 
-step_torque:
-  initial_torque: 0.0
-  torque_step: 0.1
-  hold_duration: 1.0
-  velocity_limit: 10.0
+breakaway:
+  torque_step: 0.01
+  hold_duration: 0.25
+  scan_max_torque: [0.80, 0.80, 0.60, 0.60, 0.40, 0.40, 0.40]
+
+mit_velocity:
+  kd_speed: [1.0, 1.0, 0.8, 0.8, 0.6, 0.6, 0.6]
+  ramp_acceleration: 2.0
+  steady_hold_duration: 1.0
+  steady_window_ratio: 0.5
+
+identification:
+  steady_speed_points: [0.5, 1.0, 2.0, 4.0, 6.0, 8.0]
+  repeat_count: 3
+  savgol_window: 21
+  savgol_polyorder: 3
 
 output:
   results_dir: "results"
   summary_filename: "hardware_identification_summary.npz"
   summary_csv_filename: "hardware_identification_summary.csv"
   summary_report_filename: "hardware_identification_summary.md"
+  latest_parameters_json_filename: "latest_motor_parameters.json"

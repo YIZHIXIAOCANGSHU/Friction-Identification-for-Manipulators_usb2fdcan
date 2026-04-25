@@ -27,6 +27,11 @@ class _FakeTextLog:
         self.text = str(text)
 
 
+class _FakeScalars:
+    def __init__(self, values: list[float]) -> None:
+        self.values = list(values)
+
+
 class _FakeRecordingStream:
     instances: list["_FakeRecordingStream"] = []
 
@@ -89,6 +94,7 @@ def _fake_rr_module() -> SimpleNamespace:
     _FakeRecordingStream.instances.clear()
     return SimpleNamespace(
         RecordingStream=_FakeRecordingStream,
+        Scalars=_FakeScalars,
         TextDocument=_FakeTextDocument,
         TextLog=_FakeTextLog,
         blueprint=_FakeBlueprintNamespace(),
@@ -110,6 +116,15 @@ def _top_level_tab_names(blueprint: object) -> list[str]:
     if not isinstance(tabs, _FakeBlueprintNode) or tabs.kind != "Tabs":
         return []
     return [str(child.kwargs.get("name", "")) for child in tabs.children if isinstance(child, _FakeBlueprintNode)]
+
+
+def _contains_time_series_content(node: object, *, content: str) -> bool:
+    if isinstance(node, _FakeBlueprintNode):
+        values = node.kwargs.get("contents", [])
+        if node.kind == "TimeSeriesView" and content in values:
+            return True
+        return any(_contains_time_series_content(child, content=content) for child in node.children)
+    return False
 
 
 class VisualizationTests(unittest.TestCase):
@@ -135,6 +150,12 @@ class VisualizationTests(unittest.TestCase):
                     blueprint,
                     kind="TextLogView",
                     origin="/live/feedback_frames",
+                )
+            )
+            self.assertTrue(
+                _contains_time_series_content(
+                    blueprint,
+                    content="/live/motors/motor_01/position",
                 )
             )
 
@@ -167,6 +188,12 @@ class VisualizationTests(unittest.TestCase):
             self.assertIn("pos   +1.250000 rad", payload.text)
             self.assertIn("vel   -0.500000 rad/s", payload.text)
             self.assertIn("torque   +0.750000 Nm", payload.text)
+
+            scalar_logs = [entry for entry in recording.logs if entry[0].startswith("live/motors/motor_02/")]
+            logged_paths = {entry[0] for entry in scalar_logs}
+            self.assertIn("live/motors/motor_02/position", logged_paths)
+            self.assertIn("live/motors/motor_02/velocity", logged_paths)
+            self.assertIn("live/motors/motor_02/torque", logged_paths)
 
 
 if __name__ == "__main__":

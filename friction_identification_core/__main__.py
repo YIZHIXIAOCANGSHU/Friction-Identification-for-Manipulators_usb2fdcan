@@ -2,12 +2,17 @@ from __future__ import annotations
 
 import argparse
 
-from friction_identification_core.config import DEFAULT_CONFIG_PATH, apply_overrides, load_config
+from friction_identification_core.runtime_config import DEFAULT_CONFIG_PATH, apply_overrides, load_config
 from friction_identification_core.results import log_info
-from friction_identification_core.workflow import run_step_torque
+from friction_identification_core.workflow import (
+    run_breakaway,
+    run_compensation,
+    run_identify_all,
+    run_inertia,
+    run_speed_hold,
+)
 
-
-run_step_torque_scan = run_step_torque
+MODE_CHOICES = ("identify-all", "compensation", "breakaway", "speed-hold", "inertia")
 
 
 def _default_config_argument() -> str:
@@ -15,7 +20,7 @@ def _default_config_argument() -> str:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Sequential step-torque sweep CLI.")
+    parser = argparse.ArgumentParser(description="MIT identify-all friction and inertia identification CLI.")
     parser.add_argument(
         "--config",
         default=_default_config_argument(),
@@ -23,9 +28,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--mode",
-        choices=("step", "default"),
-        default="step",
-        help="Primary runtime mode. `default` aliases to `step`.",
+        choices=MODE_CHOICES,
+        default="identify-all",
+        help="Runtime mode.",
     )
     parser.add_argument(
         "--output",
@@ -40,22 +45,25 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _normalize_mode(mode: str) -> str:
-    if mode == "default":
-        return "step"
-    return str(mode)
-
-
 def main(argv: list[str] | None = None) -> None:
     try:
         parser = build_parser()
         args = parser.parse_args(argv)
         config = load_config(args.config)
         config = apply_overrides(config, output=args.output, motors=args.motors)
-        mode = _normalize_mode(str(args.mode))
-        if mode != "step":
+        mode = str(args.mode)
+        if mode == "identify-all":
+            run_identify_all(config, show_rerun_viewer=True)
+        elif mode == "compensation":
+            run_compensation(config, show_rerun_viewer=True)
+        elif mode == "breakaway":
+            run_breakaway(config, show_rerun_viewer=True)
+        elif mode == "speed-hold":
+            run_speed_hold(config, show_rerun_viewer=True)
+        elif mode == "inertia":
+            run_inertia(config, show_rerun_viewer=True)
+        else:  # pragma: no cover
             raise ValueError(f"Unsupported mode: {mode}")
-        run_step_torque_scan(config, show_rerun_viewer=True)
     except ValueError as exc:
         raise SystemExit(f"[ERROR] {exc}") from exc
     except KeyboardInterrupt:

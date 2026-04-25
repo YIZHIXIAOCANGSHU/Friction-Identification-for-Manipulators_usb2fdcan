@@ -1,21 +1,16 @@
 from __future__ import annotations
 
+import json
 import tempfile
-import time
 import unittest
 from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
 
-from friction_identification_core.config import DEFAULT_CONFIG_PATH, apply_overrides, load_config
-from friction_identification_core.io import (
-    COMMAND_PAYLOAD_STRUCT,
-    RECV_FRAME_HEAD,
-    RECV_FRAME_SIZE,
-    RECV_FRAME_STRUCT,
-)
-from friction_identification_core.workflow import run_step_torque
+from friction_identification_core.runtime_config import DEFAULT_CONFIG_PATH, load_config
+from friction_identification_core.workflow import run_breakaway, run_compensation, run_identify_all
+from friction_identification_core.io import RECV_FRAME_HEAD, RECV_FRAME_STRUCT
 
 
 class ClosedLoopFakeTransport:
@@ -23,73 +18,99 @@ class ClosedLoopFakeTransport:
         self,
         motor_ids: tuple[int, ...],
         *,
-        step_dt: float = 0.005,
-        initial_position: float = 0.0,
-        command_gain: float = 6.0,
-        velocity_damping: float = 1.4,
-        position_stiffness: float = 1.2,
+        dt: float = 0.005,
+        static_threshold: float = 0.12,
+        tau_c: float = 0.18,
+        tau_bias: float = 0.01,
+        viscous: float = 0.04,
+        inertia: float = 0.08,
+        velocity_gain: float = 1.6,
         trip_motor_id: int | None = None,
-        trip_after_target_frames: int = 1,
+        trip_command_threshold: float = 0.05,
         trip_velocity: float | None = None,
+        initial_velocity_by_motor: dict[int, float] | None = None,
+        torque_limit: float = 2.5,
     ) -> None:
         self._motor_ids = tuple(int(motor_id) for motor_id in motor_ids)
-        self._step_dt = float(step_dt)
+        self._dt = float(dt)
+        self._static_threshold = float(static_threshold)
+        self._tau_c = float(tau_c)
+        self._tau_bias = float(tau_bias)
+        self._viscous = float(viscous)
+        self._inertia = float(inertia)
+        self._velocity_gain = float(velocity_gain)
+        self._trip_motor_id = None if trip_motor_id is None else int(trip_motor_id)
+        self._trip_command_threshold = float(trip_command_threshold)
+        self._trip_velocity = None if trip_velocity is None else float(trip_velocity)
+        self._initial_velocity_by_motor = {
+            int(motor_id): float(velocity)
+            for motor_id, velocity in (initial_velocity_by_motor or {}).items()
+        }
+        self._torque_limit = float(torque_limit)
         self._pending = bytearray()
-        self._last_commands = np.zeros(7, dtype=np.float64)
-        self._command_gain = float(command_gain)
-        self._velocity_damping = float(velocity_damping)
-        self._position_stiffness = float(position_stiffness)
-        self._states = {
-            int(motor_id): {
-                "position": float(initial_position),
-                "velocity": 0.0,
-                "torque": 0.0,
-                "temperature": 30.0 + float(motor_id),
+        self._state = {
+            motor_id: {
+                "enabled": False,
+                "mode": "mit_torque",
+                "position": 0.0,
+                "velocity": float(self._initial_velocity_by_motor.get(int(motor_id), 0.0)),
+                "torque_feedback": 0.0,
+                "torque_cmd": 0.0,
+                "velocity_cmd": 0.0,
+                "kd": 0.0,
             }
             for motor_id in self._motor_ids
         }
-        self._target_frame_count = 0
-        self._trip_motor_id = None if trip_motor_id is None else int(trip_motor_id)
-        self._trip_after_target_frames = max(int(trip_after_target_frames), 1)
-        self._trip_velocity = None if trip_velocity is None else float(trip_velocity)
-        self.writes: list[bytes] = []
+        self.writes: list[tuple[str, int, float]] = []
+        self.zero_command_count = 0
+        self.disable_count = 0
         self.closed = False
 
-    def _advance_state(self, motor_id: int) -> tuple[float, float, float, float]:
-        state = self._states[int(motor_id)]
-        command = float(self._last_commands[int(motor_id) - 1])
-        acceleration = (
-            self._command_gain * command
-            - self._velocity_damping * float(state["velocity"])
-            - self._position_stiffness * float(state["position"])
-        )
-        state["velocity"] = float(state["velocity"]) + self._step_dt * acceleration
-        state["position"] = float(state["position"]) + self._step_dt * float(state["velocity"])
-        state["torque"] = command
-        if int(motor_id) == int(self._trip_motor_id or -1):
-            self._target_frame_count += 1
-            if self._target_frame_count >= self._trip_after_target_frames and self._trip_velocity is not None:
-                state["velocity"] = float(self._trip_velocity)
-        return (
-            float(state["position"]),
-            float(state["velocity"]),
-            float(state["torque"]),
-            float(state["temperature"]),
-        )
+    def _advance_motor(self, motor_id: int) -> tuple[int, float, float, float, float]:
+        item = self._state[int(motor_id)]
+        velocity = float(item["velocity"])
+        position = float(item["position"])
+        if not bool(item["enabled"]):
+            velocity *= 0.7
+            torque_feedback = 0.0
+            state = 0
+        else:
+            state = 1
+            if str(item["mode"]) == "mit_torque":
+                applied_torque = float(item["torque_cmd"])
+            else:
+                gain = self._velocity_gain * (1.0 + float(item["kd"]))
+                applied_torque = float(np.clip(gain * (float(item["velocity_cmd"]) - velocity), -2.5, 2.5))
+            torque_feedback = float(applied_torque)
+            if int(motor_id) == int(self._trip_motor_id or -1) and abs(applied_torque) >= self._trip_command_threshold and self._trip_velocity is not None:
+                velocity = float(self._trip_velocity)
+            else:
+                direction = np.sign(velocity) if abs(velocity) > 1.0e-4 else np.sign(applied_torque)
+                friction = self._tau_c * direction + self._viscous * velocity + self._tau_bias
+                if str(item["mode"]) == "mit_torque" and abs(applied_torque) <= self._static_threshold and abs(velocity) < 0.05:
+                    velocity *= 0.8
+                else:
+                    acceleration = (applied_torque - friction) / self._inertia
+                    velocity += self._dt * acceleration
+            position += self._dt * velocity
+        item["position"] = float(position)
+        item["velocity"] = float(velocity)
+        item["torque_feedback"] = float(torque_feedback)
+        return state, float(position), float(velocity), float(torque_feedback), 30.0 + float(motor_id)
 
     def _build_cycle_bytes(self) -> bytes:
         frames = bytearray()
         for motor_id in self._motor_ids:
-            position, velocity, torque, temperature = self._advance_state(int(motor_id))
+            state, position, velocity, torque_feedback, mos_temperature = self._advance_motor(int(motor_id))
             frames.extend(
                 RECV_FRAME_STRUCT.pack(
                     RECV_FRAME_HEAD,
                     int(motor_id),
-                    1,
-                    position,
-                    velocity,
-                    torque,
-                    temperature,
+                    int(state),
+                    float(position),
+                    float(velocity),
+                    float(torque_feedback),
+                    float(mos_temperature),
                 )
             )
         return bytes(frames)
@@ -97,15 +118,68 @@ class ClosedLoopFakeTransport:
     def read(self, size: int) -> bytes:
         while len(self._pending) < int(size):
             self._pending.extend(self._build_cycle_bytes())
-        chunk = bytes(self._pending[:size])
-        del self._pending[:size]
+        chunk = bytes(self._pending[: int(size)])
+        del self._pending[: int(size)]
         return chunk
 
-    def write(self, payload: bytes) -> int:
-        self.writes.append(bytes(payload))
-        values = COMMAND_PAYLOAD_STRUCT.unpack(payload[2:30])
-        self._last_commands[:] = np.asarray(values, dtype=np.float64)
-        return len(payload)
+    def send_mit_torque(self, motor_id: int, torque: float) -> bytes:
+        item = self._state[int(motor_id)]
+        item["mode"] = "mit_torque"
+        item["torque_cmd"] = float(torque)
+        item["velocity_cmd"] = 0.0
+        packet = f"mit_torque:{int(motor_id)}:{float(torque):+.6f}".encode("ascii")
+        self.writes.append(("mit_torque", int(motor_id), float(torque)))
+        return packet
+
+    def send_mit_velocity(
+        self,
+        motor_id: int,
+        velocity: float,
+        kd: float,
+        *,
+        kp: float = 0.0,
+        torque_ff: float = 0.0,
+        position: float = 0.0,
+    ) -> bytes:
+        _ = kp, torque_ff, position
+        item = self._state[int(motor_id)]
+        item["mode"] = "mit_velocity"
+        item["velocity_cmd"] = float(velocity)
+        item["kd"] = float(kd)
+        packet = f"mit_velocity:{int(motor_id)}:{float(velocity):+.6f}:{float(kd):+.6f}".encode("ascii")
+        self.writes.append(("mit_velocity", int(motor_id), float(velocity)))
+        return packet
+
+    def send_velocity_mode(self, motor_id: int, velocity: float) -> bytes:
+        item = self._state[int(motor_id)]
+        item["mode"] = "velocity_mode"
+        item["velocity_cmd"] = float(velocity)
+        packet = f"velocity_mode:{int(motor_id)}:{float(velocity):+.6f}".encode("ascii")
+        self.writes.append(("velocity_mode", int(motor_id), float(velocity)))
+        return packet
+
+    def send_zero_command(self, motor_id: int, semantic_mode: str) -> bytes:
+        self.zero_command_count += 1
+        if semantic_mode == "mit_torque":
+            return self.send_mit_torque(int(motor_id), 0.0)
+        if semantic_mode == "mit_velocity":
+            return self.send_mit_velocity(int(motor_id), 0.0, 0.8)
+        return self.send_velocity_mode(int(motor_id), 0.0)
+
+    def enable_motor(self, motor_id: int) -> bytes:
+        self._state[int(motor_id)]["enabled"] = True
+        self.writes.append(("enable", int(motor_id), 0.0))
+        return f"enable:{int(motor_id)}".encode("ascii")
+
+    def disable_motor(self, motor_id: int) -> bytes:
+        self.disable_count += 1
+        self._state[int(motor_id)]["enabled"] = False
+        self.writes.append(("disable", int(motor_id), 0.0))
+        return f"disable:{int(motor_id)}".encode("ascii")
+
+    def clear_error(self, motor_id: int) -> bytes:
+        self.writes.append(("clear_error", int(motor_id), 0.0))
+        return f"clear_error:{int(motor_id)}".encode("ascii")
 
     def reset_input_buffer(self) -> None:
         self._pending.clear()
@@ -113,143 +187,285 @@ class ClosedLoopFakeTransport:
     def close(self) -> None:
         self.closed = True
 
+    def motor_type_name(self, motor_id: int) -> str:
+        _ = motor_id
+        return "FAKE"
 
-class OneFrameReadTransport(ClosedLoopFakeTransport):
-    def __init__(self, *args, read_sleep_s: float = 0.0, **kwargs) -> None:
-        super().__init__(*args, **kwargs)
-        self._read_sleep_s = max(float(read_sleep_s), 0.0)
+    def motor_limits(self, motor_id: int):  # noqa: ANN001
+        _ = motor_id
+        return None
 
-    def read(self, size: int) -> bytes:
-        _ = size
-        if self._read_sleep_s > 0.0:
-            time.sleep(self._read_sleep_s)
-        while len(self._pending) < RECV_FRAME_SIZE:
-            self._pending.extend(self._build_cycle_bytes())
-        chunk = bytes(self._pending[:RECV_FRAME_SIZE])
-        del self._pending[:RECV_FRAME_SIZE]
-        return chunk
+    def limit_torque_command(self, motor_id: int, torque: float) -> float:
+        _ = motor_id
+        return float(np.clip(float(torque), -self._torque_limit, self._torque_limit))
 
 
-class StepTorqueWorkflowTests(unittest.TestCase):
+class WorkflowTests(unittest.TestCase):
     def _base_config(self):
         return load_config(DEFAULT_CONFIG_PATH)
 
-    def test_default_config_exposes_step_torque_defaults(self) -> None:
-        config = self._base_config()
-
-        self.assertEqual(config.enabled_motor_ids, (1, 2, 3, 4, 5, 6, 7))
-        self.assertEqual(config.step_torque.initial_torque, 0.0)
-        self.assertEqual(config.step_torque.torque_step, 0.1)
-        self.assertEqual(config.step_torque.hold_duration, 1.0)
-        self.assertEqual(config.step_torque.velocity_limit, 10.0)
-
-    def test_motor_override_selects_requested_subset(self) -> None:
-        config = self._base_config()
-
-        self.assertEqual(apply_overrides(config, motors="all").enabled_motor_ids, (1, 2, 3, 4, 5, 6, 7))
-        self.assertEqual(apply_overrides(config, motors="2,4").enabled_motor_ids, (2, 4))
-
-    def test_step_torque_run_stops_after_reaching_motor_torque_limit(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            config = replace(
-                self._base_config(),
-                motors=replace(self._base_config().motors, enabled_ids=(1,)),
-                serial=replace(
-                    self._base_config().serial,
-                    read_chunk_size=RECV_FRAME_SIZE,
-                    read_timeout=0.001,
-                    sync_cycles_required=1,
-                    sync_timeout=0.2,
-                ),
-                step_torque=replace(
-                    self._base_config().step_torque,
-                    hold_duration=0.05,
-                ),
-                control=replace(
-                    self._base_config().control,
-                    max_torque=np.asarray([0.25, 40.0, 27.0, 27.0, 7.0, 7.0, 9.0], dtype=np.float64),
-                ),
-                output=replace(self._base_config().output, results_dir=Path(tmpdir)),
-            )
-
-            transport = OneFrameReadTransport(
-                motor_ids=(1, 2, 3, 4, 5, 6, 7),
-                read_sleep_s=0.005,
-                command_gain=2.0,
-            )
-            result = run_step_torque(config, transport_factory=lambda: transport, show_rerun_viewer=False)
-
-        self.assertEqual(len(result.artifacts), 1)
-        capture = result.artifacts[0].capture
-        self.assertEqual(capture.metadata["stop_reason"], "max_torque_reached")
-        self.assertFalse(capture.metadata["velocity_limit_reached"])
-        self.assertTrue(np.isnan(float(capture.metadata["velocity_limit_trigger_command"])))
-        self.assertTrue(np.isnan(float(capture.metadata["velocity_limit_trigger_feedback_torque"])))
-        self.assertTrue(np.isnan(float(capture.metadata["velocity_limit_trigger_velocity"])))
-        self.assertTrue(transport.closed)
-        self.assertTrue(np.isclose(capture.command[0], 0.0, atol=1.0e-6))
-        self.assertTrue(np.any(np.isclose(capture.command, 0.1, atol=1.0e-6)))
-        self.assertTrue(np.any(np.isclose(capture.command, 0.2, atol=1.0e-6)))
-        self.assertTrue(np.any(np.isclose(capture.command, 0.25, atol=1.0e-6)))
-        self.assertLessEqual(float(np.max(capture.command)), 0.25 + 1.0e-9)
-
-    def test_step_torque_run_switches_to_next_motor_after_overspeed(self) -> None:
+    def test_identify_all_generates_capture_and_summary(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             base_config = self._base_config()
             config = replace(
                 base_config,
-                motors=replace(base_config.motors, enabled_ids=(1, 2)),
-                serial=replace(
-                    base_config.serial,
-                    read_chunk_size=RECV_FRAME_SIZE,
+                motors=replace(base_config.motors, enabled_ids=(1,)),
+                transport=replace(
+                    base_config.transport,
                     read_timeout=0.001,
-                    sync_cycles_required=1,
-                    sync_timeout=0.2,
+                    read_chunk_size=RECV_FRAME_STRUCT.size * len(base_config.motor_ids),
+                    sync_timeout=0.05,
                 ),
-                step_torque=replace(
-                    base_config.step_torque,
-                    hold_duration=0.05,
+                safety=replace(
+                    base_config.safety,
+                    moving_hold_ms=5,
+                    post_abort_disable_delay_ms=10,
                 ),
-                control=replace(
-                    base_config.control,
-                    max_torque=np.asarray([0.3, 0.1, 27.0, 27.0, 7.0, 7.0, 9.0], dtype=np.float64),
+                breakaway=replace(
+                    base_config.breakaway,
+                    torque_step=0.02,
+                    hold_duration=0.02,
+                    scan_max_torque=np.asarray([0.24, 0.80, 0.60, 0.60, 0.40, 0.40, 0.40], dtype=np.float64),
+                ),
+                mit_velocity=replace(
+                    base_config.mit_velocity,
+                    kd_speed=np.asarray([0.8, 1.0, 0.8, 0.8, 0.6, 0.6, 0.6], dtype=np.float64),
+                    ramp_acceleration=40.0,
+                    steady_hold_duration=0.03,
+                    steady_window_ratio=0.5,
+                ),
+                identification=replace(
+                    base_config.identification,
+                    steady_speed_points=(0.5, 1.0, 2.0),
+                    repeat_count=1,
+                    savgol_window=9,
+                    savgol_polyorder=2,
                 ),
                 output=replace(base_config.output, results_dir=Path(tmpdir)),
             )
+            transport = ClosedLoopFakeTransport(motor_ids=base_config.motor_ids)
+            result = run_identify_all(config, transport_factory=lambda: transport, show_rerun_viewer=False)
+            self.assertTrue(transport.closed)
+            self.assertEqual(len(result.artifacts), 1)
+            artifact = result.artifacts[0]
+            self.assertIsNotNone(result.summary_paths)
+            assert result.summary_paths is not None
+            self.assertTrue(result.summary_paths.run_summary_path.exists())
+            self.assertTrue(result.summary_paths.run_summary_csv_path.exists())
+            self.assertTrue(result.summary_paths.run_summary_report_path.exists())
+            self.assertEqual(artifact.capture.metadata["mode"], "identify-all")
+            phase_names = set(artifact.capture.phase_name.astype(str).tolist())
+            self.assertTrue(any(name.startswith("breakaway_") for name in phase_names))
+            self.assertTrue(any(name.startswith("speed_hold_") for name in phase_names))
+            self.assertTrue(any(name.startswith("inertia_") for name in phase_names))
+            self.assertGreater(float(artifact.identification.breakaway.torque_positive), 0.0)
+            self.assertLess(float(artifact.identification.breakaway.torque_negative), 0.0)
+            self.assertTrue(np.isfinite(float(artifact.identification.friction.tau_c)))
+            self.assertTrue(np.isfinite(float(artifact.identification.inertia.inertia)))
 
-            transport = OneFrameReadTransport(
-                motor_ids=(1, 2, 3, 4, 5, 6, 7),
-                read_sleep_s=0.005,
-                command_gain=2.0,
+            with np.load(result.summary_paths.run_summary_path, allow_pickle=False) as summary:
+                self.assertIn("tau_c", summary.files)
+                self.assertIn("inertia", summary.files)
+                self.assertIn("recommended_for_compensation", summary.files)
+
+            latest_path = Path(tmpdir) / "latest_motor_parameters.json"
+            self.assertTrue(latest_path.exists())
+            payload = json.loads(latest_path.read_text(encoding="utf-8"))
+            self.assertEqual(payload["speed_limit_rad_s"], 10.0)
+            self.assertEqual(payload["results_dir"], str(Path(tmpdir)))
+            self.assertIn("1", payload["motors"])
+            self.assertEqual(payload["motors"]["1"]["motor_id"], 1)
+            self.assertEqual(payload["motors"]["1"]["source_run_label"], Path(result.manifest_path).parent.name)
+
+    def test_identify_all_merges_latest_parameters_by_motor(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            base_config = self._base_config()
+
+            def build_config(enabled_ids: tuple[int, ...]):
+                return replace(
+                    base_config,
+                    motors=replace(base_config.motors, enabled_ids=enabled_ids),
+                    transport=replace(
+                        base_config.transport,
+                        read_timeout=0.001,
+                        read_chunk_size=RECV_FRAME_STRUCT.size * len(base_config.motor_ids),
+                        sync_timeout=0.05,
+                    ),
+                    safety=replace(
+                        base_config.safety,
+                        moving_hold_ms=5,
+                        post_abort_disable_delay_ms=10,
+                    ),
+                    breakaway=replace(
+                        base_config.breakaway,
+                        torque_step=0.02,
+                        hold_duration=0.02,
+                        scan_max_torque=np.asarray([0.24, 0.80, 0.60, 0.60, 0.40, 0.40, 0.40], dtype=np.float64),
+                    ),
+                    mit_velocity=replace(
+                        base_config.mit_velocity,
+                        kd_speed=np.asarray([0.8, 1.0, 0.8, 0.8, 0.6, 0.6, 0.6], dtype=np.float64),
+                        ramp_acceleration=40.0,
+                        steady_hold_duration=0.03,
+                        steady_window_ratio=0.5,
+                    ),
+                    identification=replace(
+                        base_config.identification,
+                        steady_speed_points=(0.5, 1.0, 2.0),
+                        repeat_count=1,
+                        savgol_window=9,
+                        savgol_polyorder=2,
+                    ),
+                    output=replace(base_config.output, results_dir=Path(tmpdir)),
+                )
+
+            result_1 = run_identify_all(
+                build_config((1,)),
+                transport_factory=lambda: ClosedLoopFakeTransport(motor_ids=base_config.motor_ids),
+                show_rerun_viewer=False,
+            )
+            latest_path = Path(tmpdir) / "latest_motor_parameters.json"
+            payload_after_first = json.loads(latest_path.read_text(encoding="utf-8"))
+            motor_1_run_label = payload_after_first["motors"]["1"]["source_run_label"]
+            self.assertEqual(motor_1_run_label, Path(result_1.manifest_path).parent.name)
+
+            result_2 = run_identify_all(
+                build_config((2,)),
+                transport_factory=lambda: ClosedLoopFakeTransport(motor_ids=base_config.motor_ids),
+                show_rerun_viewer=False,
+            )
+            payload_after_second = json.loads(latest_path.read_text(encoding="utf-8"))
+            self.assertIn("1", payload_after_second["motors"])
+            self.assertIn("2", payload_after_second["motors"])
+            self.assertEqual(payload_after_second["motors"]["1"]["source_run_label"], motor_1_run_label)
+            self.assertEqual(
+                payload_after_second["motors"]["2"]["source_run_label"],
+                Path(result_2.manifest_path).parent.name,
+            )
+
+    def test_compensation_requires_latest_parameters(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            base_config = self._base_config()
+            config = replace(
+                base_config,
+                motors=replace(base_config.motors, enabled_ids=(1,)),
+                output=replace(base_config.output, results_dir=Path(tmpdir)),
+            )
+            with self.assertRaisesRegex(ValueError, "latest motor parameters"):
+                run_compensation(config, transport_factory=lambda: ClosedLoopFakeTransport(motor_ids=base_config.motor_ids), show_rerun_viewer=False, max_runtime_s=0.01)
+
+    def test_compensation_uses_latest_parameters_and_saves_capture_only(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            base_config = self._base_config()
+            latest_path = Path(tmpdir) / "latest_motor_parameters.json"
+            latest_path.write_text(
+                json.dumps(
+                    {
+                        "updated_at": "2026-04-25T00:00:00+00:00",
+                        "results_dir": str(Path(tmpdir)),
+                        "speed_limit_rad_s": 10.0,
+                        "motors": {
+                            "1": {
+                                "motor_id": 1,
+                                "motor_name": "motor_01",
+                                "identified_at": "2026-04-25T00:00:00+00:00",
+                                "source_run_label": "seed_run",
+                                "tau_static": 0.12,
+                                "tau_bias": 0.01,
+                                "tau_c": 0.18,
+                                "viscous": 0.04,
+                                "inertia": 0.08,
+                                "friction_validation_rmse": 0.01,
+                                "inertia_validation_rmse": 0.02,
+                                "repeat_consistency_score": 0.03,
+                                "recommended_for_compensation": False,
+                            }
+                        },
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+            config = replace(
+                base_config,
+                motors=replace(base_config.motors, enabled_ids=(1,)),
+                transport=replace(
+                    base_config.transport,
+                    read_timeout=0.001,
+                    read_chunk_size=RECV_FRAME_STRUCT.size * len(base_config.motor_ids),
+                    sync_timeout=0.05,
+                ),
+                safety=replace(
+                    base_config.safety,
+                    moving_hold_ms=5,
+                    post_abort_disable_delay_ms=10,
+                ),
+                identification=replace(
+                    base_config.identification,
+                    savgol_window=9,
+                    savgol_polyorder=2,
+                ),
+                output=replace(base_config.output, results_dir=Path(tmpdir)),
+            )
+            transport = ClosedLoopFakeTransport(
+                motor_ids=base_config.motor_ids,
+                initial_velocity_by_motor={1: 1.0},
+            )
+
+            result = run_compensation(
+                config,
+                transport_factory=lambda: transport,
+                show_rerun_viewer=False,
+                max_runtime_s=0.05,
+            )
+
+            self.assertTrue(transport.closed)
+            self.assertEqual(result.summary_paths, None)
+            capture_files = sorted(Path(tmpdir).glob("runs/*_compensation/group_01/motor_01/capture.npz"))
+            self.assertEqual(len(capture_files), 1)
+            identification_files = list(Path(tmpdir).glob("runs/*_compensation/group_01/motor_01/identification.npz"))
+            self.assertEqual(identification_files, [])
+            self.assertTrue(any(kind == "mit_torque" and abs(value) > 0.0 for kind, _, value in transport.writes))
+
+    def test_breakaway_hard_abort_sends_zero_then_disable(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            base_config = self._base_config()
+            config = replace(
+                base_config,
+                motors=replace(base_config.motors, enabled_ids=(1,)),
+                transport=replace(
+                    base_config.transport,
+                    read_timeout=0.001,
+                    read_chunk_size=RECV_FRAME_STRUCT.size * len(base_config.motor_ids),
+                    sync_timeout=0.05,
+                ),
+                safety=replace(
+                    base_config.safety,
+                    moving_hold_ms=5,
+                    post_abort_disable_delay_ms=10,
+                ),
+                breakaway=replace(
+                    base_config.breakaway,
+                    torque_step=0.02,
+                    hold_duration=0.02,
+                    scan_max_torque=np.asarray([0.24, 0.80, 0.60, 0.60, 0.40, 0.40, 0.40], dtype=np.float64),
+                ),
+                identification=replace(base_config.identification, repeat_count=1),
+                output=replace(base_config.output, results_dir=Path(tmpdir)),
+            )
+            transport = ClosedLoopFakeTransport(
+                motor_ids=base_config.motor_ids,
                 trip_motor_id=1,
-                trip_after_target_frames=3,
+                trip_command_threshold=0.02,
                 trip_velocity=12.0,
             )
-            result = run_step_torque(config, transport_factory=lambda: transport, show_rerun_viewer=False)
+            with self.assertRaises(RuntimeError):
+                run_breakaway(config, transport_factory=lambda: transport, show_rerun_viewer=False)
 
-        self.assertEqual(len(result.artifacts), 2)
-        first_capture = result.artifacts[0].capture
-        second_capture = result.artifacts[1].capture
-        self.assertEqual(first_capture.target_motor_id, 1)
-        self.assertEqual(first_capture.metadata["stop_reason"], "velocity_limit_exceeded")
-        self.assertTrue(first_capture.metadata["velocity_limit_reached"])
-        self.assertAlmostEqual(
-            float(first_capture.metadata["velocity_limit_trigger_command"]),
-            float(first_capture.command[-1]),
-            places=6,
-        )
-        self.assertAlmostEqual(
-            float(first_capture.metadata["velocity_limit_trigger_feedback_torque"]),
-            float(first_capture.torque_feedback[-1]),
-            places=6,
-        )
-        self.assertAlmostEqual(
-            float(first_capture.metadata["velocity_limit_trigger_velocity"]),
-            float(first_capture.velocity[-1]),
-            places=6,
-        )
-        self.assertEqual(second_capture.target_motor_id, 2)
-        self.assertEqual(second_capture.metadata["stop_reason"], "max_torque_reached")
+        self.assertTrue(transport.closed)
+        self.assertGreaterEqual(transport.zero_command_count, 5)
+        self.assertGreaterEqual(transport.disable_count, 1)
 
 
 if __name__ == "__main__":

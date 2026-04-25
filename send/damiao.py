@@ -1,13 +1,52 @@
-from src import usb_class,can_value_type
-from enum import IntEnum
-import time
-import struct
-import sys
-from typing import Optional
-import threading
+import argparse
+import errno
+import os
+import select
 import signal
+import socket
+import struct
+import subprocess
+import sys
+import threading
+import time
+from collections import deque
 from dataclasses import dataclass
-from typing import List
+from enum import IntEnum
+from typing import Any, Optional
+
+import numpy as np
+import rerun as rr
+import rerun.blueprint as rrb
+
+
+CAN_MTU = 16
+CANFD_MTU = 72
+CAN_RAW_FD_FRAMES = getattr(socket, "CAN_RAW_FD_FRAMES", 5)
+SOL_CAN_RAW = getattr(socket, "SOL_CAN_RAW", socket.SOL_CAN_BASE + socket.CAN_RAW)
+CANFD_BRS = getattr(socket, "CANFD_BRS", 0x01)
+
+DEFAULT_CAN_ID = 0x01
+DEFAULT_MST_ID = 0x11
+DEFAULT_MOTOR_TYPE = "DM8009"
+DEFAULT_INTERFACE = "can0"
+CLEAR_ERROR_CMD = 0xFB
+ENABLE_CMD = 0xFC
+DISABLE_CMD = 0xFD
+ZERO_CMD = 0xFE
+DEFAULT_COMMAND_INTERVAL_MS = 0.0
+DEFAULT_LISTEN_DURATION = 0.0
+DEFAULT_PRINT_INTERVAL = 0.1
+DEFAULT_SEND_RATE_LOG_INTERVAL = 0.1
+DEFAULT_BACKPRESSURE_SLEEP = 0.0005
+MAX_BACKPRESSURE_SLEEP = 0.01
+DEFAULT_CONTROL_COMMAND_REPEAT = 5
+DEFAULT_CONTROL_COMMAND_INTERVAL = 0.002
+DEFAULT_PARAM_WRITE_SETTLE = 0.002
+SERIALIZED_FEEDBACK_HEAD = 0xA5
+SERIALIZED_FEEDBACK_FORMAT = "<BBBffff"
+SERIALIZED_FEEDBACK_STRUCT = struct.Struct(SERIALIZED_FEEDBACK_FORMAT)
+VALID_FEEDBACK_STATE_CODES = frozenset({0x0, 0x1, 0x8, 0x9, 0xA, 0xB, 0xC, 0xD, 0xE})
+
 
 class DM_Motor_Type(IntEnum):
     DM3507 = 0
@@ -25,7 +64,7 @@ class DM_Motor_Type(IntEnum):
     DMH6215 = 12
     DMS3519 = 13
     DMG6220 = 14
-    Num_Of_Motor = 15
+
 
 class Control_Mode(IntEnum):
     MIT_MODE = 0x000
@@ -33,664 +72,1101 @@ class Control_Mode(IntEnum):
     VEL_MODE = 0x200
     POS_FORCE_MODE = 0x300
 
+
 class Control_Mode_Code(IntEnum):
     MIT = 1
     POS_VEL = 2
     VEL = 3
     POS_FORCE = 4
 
-@dataclass
-class DmActData:
-    motorType: DM_Motor_Type  # 是哪款电机
-    mode: Control_Mode        # 电机处于哪种控制模式
-    can_id: int
-    mst_id: int
 
-class DM_REG(IntEnum):
-    UV_Value = 0
-    KT_Value = 1
-    OT_Value = 2
-    OC_Value = 3
-    ACC = 4
-    DEC = 5
-    MAX_SPD = 6
-    MST_ID = 7
-    ESC_ID = 8
-    TIMEOUT = 9
-    CTRL_MODE = 10
-    Damp = 11
-    Inertia = 12
-    hw_ver = 13
-    sw_ver = 14
-    SN = 15
-    NPP = 16
-    Rs = 17
-    LS = 18
-    Flux = 19
-    Gr = 20
-    PMAX = 21
-    VMAX = 22
-    TMAX = 23
-    I_BW = 24
-    KP_ASR = 25
-    KI_ASR = 26
-    KP_APR = 27
-    KI_APR = 28
-    OV_Value = 29
-    GREF = 30
-    Deta = 31
-    V_BW = 32
-    IQ_c1 = 33
-    VL_c1 = 34
-    can_br = 35
-    sub_ver = 36
-    u_off = 50
-    v_off = 51
-    k1 = 52
-    k2 = 53
-    m_off = 54
-    dir = 55
-    p_m = 80
-    xout = 81
-
-limit_param = [
-    [12.566, 50, 5],   # DM3507         check 
-    [12.5, 30, 10],   # DM4310          check
-    [12.5, 50, 10],   # DM4310_48V
-    [12.5, 10, 28],   # DM4340          check
-    [12.5, 20, 28],   # DM4340_48V      check
-    [12.5, 45, 12],   # DM6006          check
-    [12.566, 20, 120],   # DM6248       check
-    [12.5, 45, 20],   # DM8006          check
-    [12.5, 45, 54],   # DM8009          check
-    [12.5, 25, 200],  # DM10010L        check
-    [12.5, 20, 200],  # DM10010         check
-    [12.5, 280, 1],   # DMH3510         check
-    [12.5, 45, 10],   # DMH6215
-    [12.5, 2000, 2],    # DMS3519         check
-    [12.5, 45, 10]    # DMG6220         check
+LIMIT_PARAM = [
+    [12.566, 50, 5],
+    [12.5, 30, 10],
+    [12.5, 50, 10],
+    [12.5, 10, 28],
+    [12.5, 20, 28],
+    [12.5, 45, 12],
+    [12.566, 20, 120],
+    [12.5, 45, 20],
+    [12.5, 45, 54],
+    [12.5, 25, 200],
+    [12.5, 20, 200],
+    [12.5, 280, 1],
+    [12.5, 45, 10],
+    [12.5, 2000, 2],
+    [12.5, 45, 10],
 ]
 
-class ValueUnion:
-    def __init__(self):
-        self.floatValue = 0.0
-        self.intValue = 0  # 若以后用到，可扩展
 
-class ValueType:
-    def __init__(self):
-        self.value = ValueUnion()
-        self.isFloat = False
+@dataclass(frozen=True)
+class MotorLimits:
+    pmax: float
+    vmax: float
+    tmax: float
 
-# 电机类
-class Motor:
-    def __init__(self, motor_type: DM_Motor_Type, ctrl_mode: Control_Mode, can_id: int, master_id: int):
-        self.Motor_Type = motor_type
-        self.mode = ctrl_mode
-        self.Can_id = can_id
-        self.Master_id = master_id
-        if motor_type.value < len(limit_param):
-            self.limit_param = limit_param[motor_type.value]
-        else:
-            raise ValueError(f"Invalid motor type: {motor_type}")
-        self.param_map: dict[int, ValueType] = {}
-        self.last_time_ = time.monotonic()
-        self.delta_time_= 0
 
-    def updateTimeInterval(self) -> float:
-        now = time.monotonic()
-        self.delta_time_ = now - self.last_time_
-        self.last_time_ = now
-        return self.delta_time_  # 单位为秒
-    
-    def getTimeInterval(self): 
-        return self.delta_time_
+MOTOR_LIMITS = {
+    motor_type: MotorLimits(*LIMIT_PARAM[motor_type.value])
+    for motor_type in DM_Motor_Type
+}
 
 
-    def receive_data(self, q: float, dq: float, tau: float):
-        self.state_q = q
-        self.state_dq = dq
-        self.state_tau = tau
+STATE_CODE_LABELS = {
+    0x0: "disabled",
+    0x1: "enabled",
+    0x8: "overvoltage",
+    0x9: "undervoltage",
+    0xA: "overcurrent",
+    0xB: "mos_overtemp",
+    0xC: "rotor_overtemp",
+    0xD: "comm_lost",
+    0xE: "overload",
+}
 
-    def set_param(self, key: int, value):
-        v = ValueType()
-        if type(value) is int:
-            v.value.uint32Value = value
-            v.isFloat = False
-        elif type(value) is float:
-            v.value.floatValue = value
-            v.isFloat = True
-        self.param_map[key] = v
 
-    def get_param_as_float(self, key: int) -> float:
-        v = self.param_map.get(key)
-        if v is not None:
-            if v.isFloat:
-                return v.value.floatValue
-        return 0.0
+RUNNING = threading.Event()
+RUNNING.set()
 
-    def get_param_as_uint32(self, key: int) -> int:
-        v = self.param_map.get(key)
-        if v is not None:
-            if not v.isFloat:
-                return v.value.uint32Value
-        return 0
-    
-    def is_have_param(self, key: int) -> bool:
-        return key in self.param_map
 
-    def GetMotorType(self):
-        return self.Motor_Type
-    def GetMotorMode(self):
-        return self.mode   
-
-    def get_limit_param(self):
-        return self.limit_param  # 获取电机限制参数   
-
-    def GetMasterId(self):
-        return self.Master_id  # 获取反馈ID    
-
-    def GetCanId(self):
-        return self.Can_id  # 获取电机CAN ID
-
-    def Get_Position(self):
-        return self.state_q
-
-    def Get_Velocity(self):
-        return self.state_dq
-
-    def Get_tau(self):
-        return self.state_tau
-
-    def set_mode(self, value: Control_Mode):
-        self.mode = value
-
-class Motor_Control:
-    def __init__(self, nom_baud: int, dat_baud: int, sn: str , data_ptr: list):
-        self.data_ptr_ = data_ptr
-        self.motors: dict[int, Motor] = {}
-        self.read_write_save = threading.Event()# 初始为未设置状态
-        self.read_write_save.clear()
-        
-        # 遍历该bus下所有电机
-        for act_data in self.data_ptr_:
-            motor = Motor(act_data.motorType, act_data.mode, act_data.can_id, act_data.mst_id)
-            self.addMotor(motor)
-
-        self.usb_hw = usb_class(nom_baud, dat_baud,sn)
-        time.sleep(0.5)
-
-        self.usb_hw.setFrameCallback(lambda val: self.canframeCallback(val))
-        time.sleep(0.2)
-
-        self.enable_all()  # 使能该接口下的所有电机
-        print("**********Motor_Control init success**********\n")
-
-    # def __del__(self):
-    #       print("Enter ~Motor_Control")
-    #       if self.getUSBHw().getDeviceHandle() is not None:
-    #           self.disable_all()  # 使能该接口下的所有电机
-    #           self.usb_hw.close()
-     
-    def __enter__(self):
-        # 必须返回 self 才能赋值给 usb2
-        print("__enter__  Motor_Control")
-        return self
-
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        print("__exit__  Motor_Control")
-        if self.getUSBHw().getDeviceHandle() is not None:
-            self.disable_all()  # 失能该接口下的所有电机
-            self.usb_hw.close()
-
-    def close(self):
-        print("close  Motor_Control")
-        if self.getUSBHw().getDeviceHandle() is not None:
-            self.disable_all()  # 使能该接口下的所有电机
-            self.usb_hw.close()
-
-    @staticmethod
-    def is_in_ranges(number: int) -> bool:
-        return (7 <= number <= 10) or (13 <= number <= 16) or (35 <= number <= 36)
-
-    @staticmethod
-    def float_to_uint32(value: float) -> int:
-        return int(value)
-
-    @staticmethod
-    def uint32_to_float(value: int) -> float:
-        return float(value)
-
-    @staticmethod
-    def uint8_to_float(data: List[int]) -> float:
-        """
-        参数 `data` 应为长度为 4 的整数列表（0-255）。
-        例如：data = [0xDB, 0x0F, 0x49, 0x40] 表示 float 3.1415927
-        """
-        if len(data) != 4:
-            raise ValueError("data must be a list of 4 bytes")
-        byte_data = bytes(data)
-        return struct.unpack('<f', byte_data)[0]
-    
-    def getMotor(self, id: int) -> Optional[Motor]:
-        motor = self.motors.get(id)
-        if motor is not None:
-            return motor
-        else:
-            print(f"[Error] In getMotor, no motor with id {id} is registered.")
-            return None
-
-    def getUSBHw(self) -> Optional[usb_class]:
-        return self.usb_hw
-    
-    def addMotor(self, DM_Motor:Motor):
-        self.motors[DM_Motor.GetCanId()] = DM_Motor
-        self.motors[DM_Motor.GetMasterId()] = DM_Motor
-
-    def enable_all(self):
-        # data=[4,0,0,0]
-        # for motor in self.motors.values():
-        #         for _ in range(5):
-        #             self.write_motor_param(motor,0x23,data)
-        #             time.sleep(0.002)  # 2000 microseconds = 2 milliseconds
-        #             self.write_motor_param(motor,0x23,data)
-        #             time.sleep(0.002)
-        # for motor in self.motors.values():
-        #     self.read_motor_param(motor,10)
-        # for motor in self.motors.values():
-        #     parm=motor.get_param_as_uint32(10)
-        #     print(f"id: {motor.GetCanId()} mode is {parm}", file=sys.stderr)
-
-        # for motor in self.motors.values():
-        #     self.switchControlMode(motor,Control_Mode_Code.MIT)
-        # for motor in self.motors.values():
-        #     self.read_motor_param(motor,10)
-        # for motor in self.motors.values():
-        #     parm=motor.get_param_as_uint32(10)
-        #     print(f"id: {motor.GetCanId()} mode is {parm}", file=sys.stderr)
-
-        for motor in self.motors.values():
-            self.switchControlMode(motor,Control_Mode_Code.VEL)
-        for motor in self.motors.values():
-            self.read_motor_param(motor,10)
-        for motor in self.motors.values():
-            parm=motor.get_param_as_uint32(10)
-            print(f"id: {motor.GetCanId()} mode is {parm}", file=sys.stderr)
-
-        for motor in self.motors.values():
-            for _ in range(5):
-                self.control_cmd(motor.GetCanId() + motor.GetMotorMode(), 0xFC)
-                time.sleep(0.002)  
-
-    def disable_all(self):
-        for key, motor in self.motors.items():  # motors 是一个字典
-            for _ in range(5):
-                self.control_cmd(motor.GetCanId() + motor.GetMotorMode(), 0xFD)
-                time.sleep(0.002)  # 2000 微秒 = 2 毫秒
-
-    def read_motor_param(self, DM_Motor, RID: int) -> float:
-        self.read_write_save.set()  # 表示正在进行参数读取
-
-        can_id = DM_Motor.GetCanId()
-        id_low = can_id & 0xFF
-        id_high = (can_id >> 8) & 0xFF
-
-        mydata = bytes([id_low, id_high, 0x33, RID, 0x00, 0x00, 0x00, 0x00])
-        self.usb_hw.fdcanFrameSend(mydata, 0x7FF)
-        time.sleep(0.002)
-        return 0.0
-
-    def save_motor_param(self, DM_Motor):
-        id = DM_Motor.GetCanId()
-        mode = DM_Motor.GetMotorMode()
-        self.control_cmd(id + mode, 0xFD)  # 失能
-        time.sleep(0.01)  # 10000 微秒 = 10 毫秒
-
-        self.read_write_save.set()  # 标志位
-
-        id_low = id & 0xFF
-        id_high = (id >> 8) & 0xFF
-
-        mydata = bytes([id_low, id_high, 0xAA, 0x01, 0x00, 0x00, 0x00, 0x00])
-        self.usb_hw.fdcanFrameSend(mydata, 0x7FF)
-
-        time.sleep(0.1)  # 100000 微秒 = 100 毫秒
-
-    def refresh_motor_status(self, motor):
-        id_low = motor.GetCanId() & 0xFF
-        id_high = (motor.GetCanId() >> 8) & 0xFF
-
-        mydata = bytes([id_low, id_high, 0xCC, 0x00])
-        self.usb_hw.fdcanFrameSend(mydata, 0x7FF)
-
-    def control_cmd(self, id: int, cmd: int):
-        mydata = bytes([0xFF] * 7 + [cmd])
-        self.usb_hw.fdcanFrameSend(mydata, id)
-
-    def write_motor_param(self, DM_Motor, RID: int, data: list):
-        self.read_write_save.set()
-
-        id = DM_Motor.GetCanId()
-        id_low = id & 0xFF
-        id_high = (id >> 8) & 0xFF
-
-        mydata = bytes([id_low, id_high, 0x55, RID, data[0], data[1], data[2], data[3]])
-        self.usb_hw.fdcanFrameSend(mydata, 0x7FF)
-        time.sleep(0.002)
-
-    def set_zero_position(self, DM_Motor):
-        self.control_cmd(DM_Motor.GetCanId() + DM_Motor.GetMotorMode(), 0xFE)
-        time.sleep(0.002)
-
-    def control_mit(self, DM_Motor, kp: float, kd: float, q: float, dq: float, tau: float):
-        float_to_uint = lambda x, xmin, xmax, bits: int((x - xmin) / (xmax - xmin) * ((1 << bits) - 1))
-
-        id = DM_Motor.GetCanId()
-        if id not in self.motors:
-            print(f"[Error] In control_mit, no motor with id {DM_Motor.GetCanId()} is registered.")
-            sys.exit(-1)
-
-        m = self.motors[id]
-        kp_uint = float_to_uint(kp, 0, 500, 12)
-        kd_uint = float_to_uint(kd, 0, 5, 12)
-
-        limit_param_cmd = m.get_limit_param()
-
-        q_uint = float_to_uint(q, -limit_param_cmd[0], limit_param_cmd[0], 16)
-        dq_uint = float_to_uint(dq, -limit_param_cmd[1], limit_param_cmd[1], 12)
-        tau_uint = float_to_uint(tau, -limit_param_cmd[2], limit_param_cmd[2], 12)
-
-        can_id = id + Control_Mode.MIT_MODE
-
-        data = [0] * 8
-        data[0] = (q_uint >> 8) & 0xff
-        data[1] = q_uint & 0xff
-        data[2] = dq_uint >> 4
-        data[3] = ((dq_uint & 0xf) << 4) | ((kp_uint >> 8) & 0xf)
-        data[4] = kp_uint & 0xff
-        data[5] = kd_uint >> 4
-        data[6] = ((kd_uint & 0xf) << 4) | ((tau_uint >> 8) & 0xf)
-        data[7] = tau_uint & 0xff
-
-        self.usb_hw.fdcanFrameSend(data, can_id)
-
-    def control_pos_vel(self, DM_Motor, pos: float, vel: float):
-        id_ = DM_Motor.GetCanId()
-        if id_ not in self.motors:
-            print(f"[Error] In control_pos_vel, no motor with id {id_} is registered.", file=sys.stderr)
-            sys.exit(-1)  # 终止程序，返回非 0 表示错误
-
-        can_id = id_ + Control_Mode.POS_VEL_MODE  # 需要保证 self.POS_VEL_MODE 定义了
-
-        # 把 float 按 4 字节小端序转换为 bytes
-        pbuf = struct.pack('<f', pos)
-        vbuf = struct.pack('<f', vel)
-
-        # 组合数据成长度8的list
-        mydata = list(pbuf + vbuf)  # bytes 拼接后转成列表
-
-        self.usb_hw.fdcanFrameSend(mydata, can_id)
-
-    def control_vel(self, DM_Motor, vel: float):
-        id_ = DM_Motor.GetCanId()
-        if id_ not in self.motors:
-            print(f"[Error] In control_vel, no motor with id {id_} is registered.", file=sys.stderr)
-            sys.exit(-1)
-
-        can_id = id_ + Control_Mode.VEL_MODE
-
-        # 把 float 按 4 字节小端序转换成 bytes
-        vbuf = struct.pack('<f', vel)
-
-        # 只取4个字节，转换成列表
-        mydata = list(vbuf)
-
-        self.usb_hw.fdcanFrameSend(mydata, can_id)
-
-    def receive_param(self, data: bytes):
-        canID = (data[1] << 8) | data[0]
-        RID = data[3]
-        if canID not in self.motors:
-            print(f"[Error] In receive_param, no motor with id {canID} is registered.", file=sys.stderr)
-            sys.exit(-1)
-
-        if self.is_in_ranges(RID):
-            data_uint32 = (data[7] << 24) | (data[6] << 16) | (data[5] << 8) | data[4]
-            self.motors[canID].set_param(RID, data_uint32)
-
-            if RID == 10:
-                if data_uint32 == 1:
-                    self.motors[canID].set_mode(Control_Mode.MIT_MODE)
-                elif data_uint32 == 2:
-                    self.motors[canID].set_mode(Control_Mode.POS_VEL_MODE)
-                elif data_uint32 == 3:
-                    self.motors[canID].set_mode(Control_Mode.VEL_MODE)
-                elif data_uint32 == 4:
-                    self.motors[canID].set_mode(Control_Mode.POS_FORCE_MODE)
-        else:
-            data_float = self.uint8_to_float(data[4:8])  # 取4个字节，转float
-            self.motors[canID].set_param(RID, data_float)
-    
-    def switchControlMode(self, DM_Motor, mode:Control_Mode_Code):
-        write_data = bytes([mode, 0x00, 0x00, 0x00])
-        RID = 10
-        self.write_motor_param(DM_Motor, RID, write_data)
-
-        can_id = DM_Motor.GetCanId()
-        if can_id not in self.motors:
-            print(f"[Error] In switchControlMode, no motor with id {can_id} is registered.", file=sys.stderr)
-            sys.exit(-1)
-            return False
-
-        return True
-
-    def change_motor_param(self, DM_Motor, RID, data):
-        if self.is_in_ranges(RID):
-            # 传入的应转换为整型表示
-            data_uint32 = self.float_to_uint32(data)
-            data_bytes = data_uint32.to_bytes(4, byteorder='little')
-            self.write_motor_param(DM_Motor, RID, data_bytes)
-        else:
-            data_bytes = struct.pack('f', data)
-            self.write_motor_param(DM_Motor, RID, data_bytes)
-
-        can_id = DM_Motor.GetCanId()
-        if can_id not in self.motors:
-            print(f"[Error] In change_motor_param, no motor with id {can_id} is registered.", file=sys.stderr)
-            sys.exit(-1)
-            return False
-
-        return True
-
-    def changeMotorLimit(self, DM_Motor, P_MAX, Q_MAX, T_MAX):
-        motor_type = DM_Motor.GetMotorType()
-        self.limit_param[motor_type] = [P_MAX, Q_MAX, T_MAX]
-
-    """ 
-    can_value_type在usb_class类里面是这样定义的
-        class can_head_type:
-            def __init__(self):
-                self.id = 0
-                self.time_stamp = 0
-                self.reserve = [0, 0, 0]
-                self.fram_type = 0
-                self.can_type = 0
-                self.id_type = 0
-                self.dir = 0
-                self.dlc = 0  
-
-        class can_value_type:
-            def __init__(self):
-                self.head = can_head_type()
-                self.data = [0] * 64
-    """
-    def canframeCallback(self, value:can_value_type):
-        uint_to_float = lambda x, xmin, xmax, bits: ((float(x) / ((1 << bits) - 1)) * (xmax - xmin)) + xmin
-
-        canID = value.head.id
-
-        if self.read_write_save.is_set() and canID in self.motors:
-            if value.data[2] in (0x33, 0x55, 0xAA):
-                if value.data[2] in (0x33, 0x55):
-                    #print(value.data[4])
-                    self.receive_param(bytes(value.data))
-                    self.read_write_save.clear()
-                self.read_write_save.clear()
-        else:
-            q_uint = (value.data[1] << 8) | value.data[2]
-            dq_uint = (value.data[3] << 4) | (value.data[4] >> 4)
-            tau_uint = ((value.data[4] & 0xf) << 8) | value.data[5]
-
-            if canID not in self.motors:
-                return
-
-            m = self.motors[canID]
-            limit_param_receive = m.get_limit_param()
-            receive_q = uint_to_float(q_uint, -limit_param_receive[0], limit_param_receive[0], 16)
-            receive_dq = uint_to_float(dq_uint, -limit_param_receive[1], limit_param_receive[1], 12)
-            receive_tau = uint_to_float(tau_uint, -limit_param_receive[2], limit_param_receive[2], 12)
-
-            m.receive_data(receive_q, receive_dq, receive_tau)
-
-            interval=m.updateTimeInterval()
-            
-            #print(f"motor id is: {canID}: {interval}", file=sys.stderr)
-            
-            
-           
-running =threading.Event()
-running.set()  # 初始为 True
-
-# Ctrl+C 信号处理函数
 def signal_handler(signum, frame):
-    running.clear()
+    _ = frame
+    RUNNING.clear()
     sys.stderr.write(f"\nInterrupt signal ({signum}) received.\n")
     sys.stderr.flush()
 
 
-
-running =threading.Event()
-running.set()  # 初始为 True
-
-# Ctrl+C 信号处理函数
-def signal_handler(signum, frame):
-    running.clear()
-    sys.stderr.write(f"\nInterrupt signal ({signum}) received.\n")
-    sys.stderr.flush()
-
-# 注册 SIGINT 处理（即 Ctrl+C）
 signal.signal(signal.SIGINT, signal_handler)
+signal.signal(signal.SIGTERM, signal_handler)
+
+
+@dataclass
+class MotorConfig:
+    motor_type: DM_Motor_Type
+    can_id: int
+    mst_id: int
+    mode: Control_Mode
+
+
+@dataclass
+class MotorFeedback:
+    position: float = 0.0
+    velocity: float = 0.0
+    torque: float = 0.0
+    delta_time: float = 0.0
+    last_time: float = 0.0
+    controller_id: int = 0
+    state_code: int = 0
+    mos_temp: float = 0.0
+    rotor_temp: float = 0.0
+
+    def update(
+        self,
+        position: float,
+        velocity: float,
+        torque: float,
+        *,
+        controller_id: int = 0,
+        state_code: int = 0,
+        mos_temp: float = 0.0,
+        rotor_temp: float = 0.0,
+    ) -> None:
+        now = time.monotonic()
+        self.delta_time = 0.0 if self.last_time == 0.0 else now - self.last_time
+        self.last_time = now
+        self.position = float(position)
+        self.velocity = float(velocity)
+        self.torque = float(torque)
+        self.controller_id = int(controller_id)
+        self.state_code = int(state_code)
+        self.mos_temp = float(mos_temp)
+        self.rotor_temp = float(rotor_temp)
+
+
+@dataclass(frozen=True)
+class DecodedFeedbackFrame:
+    motor_id: int
+    can_id: int
+    mst_id: int
+    state: int
+    controller_id: int
+    position: float
+    velocity: float
+    torque: float
+    mos_temperature: float
+    rotor_temperature: float
+
+
+@dataclass(frozen=True)
+class _DamiaoMotorMapping:
+    motor_id: int
+    can_id: int
+    mst_id: int
+    motor_type: DM_Motor_Type
+
+
+def int_auto(value: str) -> int:
+    return int(value, 0)
+
+
+def float_to_uint(value: float, xmin: float, xmax: float, bits: int) -> int:
+    if xmax <= xmin:
+        raise ValueError("xmax must be larger than xmin")
+    clamped = min(max(float(value), xmin), xmax)
+    scale = (1 << bits) - 1
+    return int((clamped - xmin) / (xmax - xmin) * scale)
+
+
+def uint_to_float(value: int, xmin: float, xmax: float, bits: int) -> float:
+    scale = (1 << bits) - 1
+    return ((float(value) / scale) * (xmax - xmin)) + xmin
+
+
+def mode_to_code(mode: Control_Mode) -> Control_Mode_Code:
+    mapping = {
+        Control_Mode.MIT_MODE: Control_Mode_Code.MIT,
+        Control_Mode.POS_VEL_MODE: Control_Mode_Code.POS_VEL,
+        Control_Mode.VEL_MODE: Control_Mode_Code.VEL,
+        Control_Mode.POS_FORCE_MODE: Control_Mode_Code.POS_FORCE,
+    }
+    return mapping[mode]
+
+
+def parse_mode(value: str) -> Control_Mode:
+    mapping = {
+        "mit": Control_Mode.MIT_MODE,
+        "pos-vel": Control_Mode.POS_VEL_MODE,
+        "vel": Control_Mode.VEL_MODE,
+        "pos-force": Control_Mode.POS_FORCE_MODE,
+    }
+    return mapping[value]
+
+
+def parse_motor_type(value: str) -> DM_Motor_Type:
+    return DM_Motor_Type[value]
+
+
+def get_motor_limits(motor_type: DM_Motor_Type | str) -> MotorLimits:
+    if isinstance(motor_type, str):
+        motor_type = DM_Motor_Type[str(motor_type)]
+    return MOTOR_LIMITS[DM_Motor_Type(motor_type)]
+
+
+def pack_can_frame(can_id: int, payload: bytes) -> bytes:
+    if len(payload) > 8:
+        raise ValueError("Classic CAN payload must be 8 bytes or fewer")
+    return struct.pack("=IB3x8s", int(can_id), len(payload), payload.ljust(8, b"\x00"))
+
+
+def pack_canfd_frame(can_id: int, payload: bytes, flags: int = 0) -> bytes:
+    if len(payload) > 64:
+        raise ValueError("CAN FD payload must be 64 bytes or fewer")
+    return struct.pack("=IBB2x64s", int(can_id), len(payload), int(flags), payload.ljust(64, b"\x00"))
+
+
+def unpack_can_packet(packet: bytes) -> tuple[int, bytes]:
+    if len(packet) == CAN_MTU:
+        can_id, can_dlc, data = struct.unpack("=IB3x8s", packet)
+        return can_id & socket.CAN_SFF_MASK, data[:can_dlc]
+    if len(packet) == CANFD_MTU:
+        can_id, length, _, data = struct.unpack("=IBB2x64s", packet)
+        return can_id & socket.CAN_SFF_MASK, data[:length]
+    raise ValueError(f"Unsupported CAN packet size: {len(packet)}")
+
+
+def build_control_cmd_frame(can_id: int, cmd: int) -> tuple[int, bytes]:
+    return int(can_id), bytes([0xFF] * 7 + [int(cmd)])
+
+
+def build_param_read_frame(can_id: int, rid: int) -> tuple[int, bytes]:
+    return 0x7FF, bytes([can_id & 0xFF, (can_id >> 8) & 0xFF, 0x33, rid, 0x00, 0x00, 0x00, 0x00])
+
+
+def build_param_write_frame(can_id: int, rid: int, data: bytes) -> tuple[int, bytes]:
+    if len(data) != 4:
+        raise ValueError("Motor parameter writes require exactly 4 data bytes")
+    return 0x7FF, bytes([can_id & 0xFF, (can_id >> 8) & 0xFF, 0x55, rid, *data])
+
+
+def build_vel_frame(can_id: int, velocity: float) -> tuple[int, bytes]:
+    return int(can_id) + Control_Mode.VEL_MODE, struct.pack("<f", float(velocity))
+
+
+def build_pos_vel_frame(can_id: int, position: float, velocity: float) -> tuple[int, bytes]:
+    return int(can_id) + Control_Mode.POS_VEL_MODE, struct.pack("<ff", float(position), float(velocity))
+
+
+def build_mit_frame(
+    can_id: int,
+    motor_type: DM_Motor_Type,
+    kp: float,
+    kd: float,
+    position: float,
+    velocity: float,
+    torque: float,
+) -> tuple[int, bytes]:
+    limits = get_motor_limits(motor_type)
+    kp_uint = float_to_uint(kp, 0, 500, 12)
+    kd_uint = float_to_uint(kd, 0, 5, 12)
+    q_uint = float_to_uint(position, -limits.pmax, limits.pmax, 16)
+    dq_uint = float_to_uint(velocity, -limits.vmax, limits.vmax, 12)
+    tau_uint = float_to_uint(torque, -limits.tmax, limits.tmax, 12)
+    data = bytes(
+        [
+            (q_uint >> 8) & 0xFF,
+            q_uint & 0xFF,
+            (dq_uint >> 4) & 0xFF,
+            ((dq_uint & 0x0F) << 4) | ((kp_uint >> 8) & 0x0F),
+            kp_uint & 0xFF,
+            (kd_uint >> 4) & 0xFF,
+            ((kd_uint & 0x0F) << 4) | ((tau_uint >> 8) & 0x0F),
+            tau_uint & 0xFF,
+        ]
+    )
+    return int(can_id) + Control_Mode.MIT_MODE, data
+
+
+def decode_feedback(data: bytes, motor_type: DM_Motor_Type) -> MotorFeedback:
+    if len(data) < 8:
+        raise ValueError("Motor feedback requires 8 bytes")
+    limits = get_motor_limits(motor_type)
+    controller_id = data[0] & 0x0F
+    state_code = (data[0] >> 4) & 0x0F
+    q_uint = (data[1] << 8) | data[2]
+    dq_uint = (data[3] << 4) | (data[4] >> 4)
+    tau_uint = ((data[4] & 0x0F) << 8) | data[5]
+    return MotorFeedback(
+        position=uint_to_float(q_uint, -limits.pmax, limits.pmax, 16),
+        velocity=uint_to_float(dq_uint, -limits.vmax, limits.vmax, 12),
+        torque=uint_to_float(tau_uint, -limits.tmax, limits.tmax, 12),
+        controller_id=controller_id,
+        state_code=state_code,
+        mos_temp=float(data[6]),
+        rotor_temp=float(data[7]),
+    )
+
+
+class SocketCanTransport:
+    def __init__(self, interface: str, force_fd: bool = True, fd_flags: int = CANFD_BRS):
+        self.interface = str(interface)
+        self.force_fd = bool(force_fd)
+        self.fd_flags = int(fd_flags)
+        self.socket = socket.socket(socket.PF_CAN, socket.SOCK_RAW, socket.CAN_RAW)
+        self.socket.setsockopt(SOL_CAN_RAW, CAN_RAW_FD_FRAMES, 1)
+        self.socket.settimeout(0.1)
+        self.socket.bind((self.interface,))
+
+    def close(self) -> None:
+        self.socket.close()
+
+    def send(self, can_id: int, payload: bytes) -> None:
+        if self.force_fd:
+            packet = pack_canfd_frame(int(can_id), payload, flags=self.fd_flags)
+        else:
+            packet = pack_can_frame(int(can_id), payload) if len(payload) <= 8 else pack_canfd_frame(int(can_id), payload)
+        self.socket.send(packet)
+
+    def recv(self, timeout: float = 0.1) -> Optional[tuple[int, bytes]]:
+        try:
+            ready, _, _ = select.select([self.socket], [], [], float(timeout))
+            if not ready:
+                return None
+            packet = self.socket.recv(CANFD_MTU)
+        except socket.timeout:
+            return None
+        return unpack_can_packet(packet)
+
+
+class SocketCanMotorController:
+    def __init__(self, interface: str, motor: MotorConfig):
+        self.transport = SocketCanTransport(interface)
+        self.motor = motor
+        self.feedback = MotorFeedback()
+        self._rx_running = threading.Event()
+        self._rx_thread: Optional[threading.Thread] = None
+        self._lock = threading.Lock()
+
+    def start(self) -> None:
+        self._rx_running.set()
+        self._rx_thread = threading.Thread(target=self._recv_loop, daemon=True)
+        self._rx_thread.start()
+
+    def close(self) -> None:
+        self.disable()
+        self._rx_running.clear()
+        if self._rx_thread is not None:
+            self._rx_thread.join(timeout=1.0)
+        self.transport.close()
+
+    def _recv_loop(self) -> None:
+        while self._rx_running.is_set():
+            packet = self.transport.recv()
+            if packet is None:
+                continue
+            can_id, data = packet
+            if can_id not in (self.motor.can_id, self.motor.mst_id):
+                continue
+            if len(data) >= 6 and data[2] not in (0x33, 0x55, 0xAA):
+                decoded = decode_feedback(data, self.motor.motor_type)
+                with self._lock:
+                    self.feedback.update(
+                        decoded.position,
+                        decoded.velocity,
+                        decoded.torque,
+                        controller_id=decoded.controller_id,
+                        state_code=decoded.state_code,
+                        mos_temp=decoded.mos_temp,
+                        rotor_temp=decoded.rotor_temp,
+                    )
+
+    def send(self, can_id: int, payload: bytes) -> None:
+        self.transport.send(can_id, payload)
+
+    def switch_control_mode(self, mode: Control_Mode) -> None:
+        can_id, payload = build_param_write_frame(self.motor.can_id, 10, bytes([mode_to_code(mode), 0x00, 0x00, 0x00]))
+        self.send(can_id, payload)
+        self.motor.mode = mode
+        time.sleep(0.01)
+
+    def enable(self) -> None:
+        self.switch_control_mode(self.motor.mode)
+        control_id = self.motor.can_id + self.motor.mode
+        can_id, payload = build_control_cmd_frame(control_id, ENABLE_CMD)
+        for _ in range(5):
+            self.send(can_id, payload)
+            time.sleep(0.002)
+
+    def disable(self) -> None:
+        control_id = self.motor.can_id + self.motor.mode
+        can_id, payload = build_control_cmd_frame(control_id, DISABLE_CMD)
+        for _ in range(5):
+            try:
+                self.send(can_id, payload)
+            except OSError:
+                break
+            time.sleep(0.002)
+
+    def set_zero_position(self) -> None:
+        can_id, payload = build_control_cmd_frame(self.motor.can_id + self.motor.mode, ZERO_CMD)
+        self.send(can_id, payload)
+        time.sleep(0.002)
+
+    def control_velocity(self, velocity: float) -> None:
+        can_id, payload = build_vel_frame(self.motor.can_id, velocity)
+        self.send(can_id, payload)
+
+    def control_position_velocity(self, position: float, velocity: float) -> None:
+        can_id, payload = build_pos_vel_frame(self.motor.can_id, position, velocity)
+        self.send(can_id, payload)
+
+    def control_mit(self, kp: float, kd: float, position: float, velocity: float, torque: float) -> None:
+        can_id, payload = build_mit_frame(self.motor.can_id, self.motor.motor_type, kp, kd, position, velocity, torque)
+        self.send(can_id, payload)
+
+    def read_feedback(self) -> MotorFeedback:
+        with self._lock:
+            return MotorFeedback(
+                position=self.feedback.position,
+                velocity=self.feedback.velocity,
+                torque=self.feedback.torque,
+                delta_time=self.feedback.delta_time,
+                last_time=self.feedback.last_time,
+                controller_id=self.feedback.controller_id,
+                state_code=self.feedback.state_code,
+                mos_temp=self.feedback.mos_temp,
+                rotor_temp=self.feedback.rotor_temp,
+            )
+
+
+class DamiaoSocketCanTransport:
+    def __init__(self, config: Any, *, can_transport: Any | None = None) -> None:
+        self._root_config = config
+        self._config = getattr(config, "transport", config)
+        self._pending = bytearray()
+        self._decoded_frames: deque[DecodedFeedbackFrame] = deque()
+        self._motor_mappings = self._build_motor_mappings()
+        self._feedback_mapping = self._build_feedback_mapping(self._motor_mappings)
+        self._current_modes: dict[int, Control_Mode] = {}
+        self._last_mit_velocity_kd: dict[int, float] = {}
+        self._transport = can_transport
+        self._closed = False
+        if self._transport is None:
+            if bool(self._config.configure_interface):
+                configure_can_interface(
+                    self._config.interface,
+                    self._config.nominal_bitrate,
+                    self._config.data_bitrate,
+                )
+            ensure_interface_ready(
+                self._config.interface,
+                self._config.nominal_bitrate,
+                self._config.data_bitrate,
+            )
+            self._transport = SocketCanTransport(
+                self._config.interface,
+                force_fd=bool(self._config.force_fd),
+            )
+
+    def _motor_ids(self) -> tuple[int, ...]:
+        if hasattr(self._root_config, "motor_ids"):
+            return tuple(int(motor_id) for motor_id in self._root_config.motor_ids)
+        return tuple(range(1, len(self._config.motor_can_ids) + 1))
+
+    def _build_motor_mappings(self) -> tuple[_DamiaoMotorMapping, ...]:
+        motor_ids = self._motor_ids()
+        mappings: list[_DamiaoMotorMapping] = []
+        for index, motor_id in enumerate(motor_ids):
+            mappings.append(
+                _DamiaoMotorMapping(
+                    motor_id=int(motor_id),
+                    can_id=int(self._config.motor_can_ids[index]),
+                    mst_id=int(self._config.motor_mst_ids[index]),
+                    motor_type=DM_Motor_Type[str(self._config.motor_types[index])],
+                )
+            )
+        return tuple(mappings)
+
+    @staticmethod
+    def _build_feedback_mapping(mappings: tuple[_DamiaoMotorMapping, ...]) -> dict[int, _DamiaoMotorMapping]:
+        feedback_mapping: dict[int, _DamiaoMotorMapping] = {}
+        for mapping in mappings:
+            feedback_mapping[int(mapping.can_id)] = mapping
+            feedback_mapping[int(mapping.mst_id)] = mapping
+        return feedback_mapping
+
+    def _trace_packet(self, can_id: int, payload: bytes) -> bytes:
+        if bool(self._config.force_fd):
+            return pack_canfd_frame(int(can_id), payload, flags=CANFD_BRS)
+        if len(payload) <= 8:
+            return pack_can_frame(int(can_id), payload)
+        return pack_canfd_frame(int(can_id), payload)
+
+    def _send_with_retry(self, can_id: int, payload: bytes) -> bytes:
+        send_frame(self._transport, (int(can_id), bytes(payload)))
+        return self._trace_packet(int(can_id), bytes(payload))
+
+    def _mapping_for_motor_id(self, motor_id: int) -> _DamiaoMotorMapping:
+        target_motor_id = self._validate_motor_id(int(motor_id))
+        for mapping in self._motor_mappings:
+            if int(mapping.motor_id) == target_motor_id:
+                return mapping
+        raise ValueError(f"Unknown motor_id: {target_motor_id}")
+
+    def _mode_for_semantic(self, semantic_mode: str) -> Control_Mode:
+        if semantic_mode in {"mit_torque", "mit_velocity"}:
+            return Control_Mode.MIT_MODE
+        if semantic_mode == "velocity_mode":
+            return Control_Mode.VEL_MODE
+        raise ValueError(f"Unsupported semantic_mode: {semantic_mode}")
+
+    def _get_active_mode(self, mapping: _DamiaoMotorMapping, fallback: Control_Mode = Control_Mode.MIT_MODE) -> Control_Mode:
+        return self._current_modes.get(int(mapping.motor_id), fallback)
+
+    def _ensure_mode(self, mapping: _DamiaoMotorMapping, mode: Control_Mode) -> bytes:
+        if self._get_active_mode(mapping, mode) == mode and int(mapping.motor_id) in self._current_modes:
+            return b""
+        can_id, payload = build_param_write_frame(
+            int(mapping.can_id),
+            10,
+            bytes([int(mode_to_code(mode)), 0x00, 0x00, 0x00]),
+        )
+        packet = self._send_with_retry(can_id, payload)
+        self._current_modes[int(mapping.motor_id)] = Control_Mode(mode)
+        time.sleep(DEFAULT_PARAM_WRITE_SETTLE)
+        return packet
+
+    def _send_control(self, mapping: _DamiaoMotorMapping, cmd: int, *, mode: Control_Mode | None = None) -> bytes:
+        active_mode = self._get_active_mode(mapping) if mode is None else Control_Mode(mode)
+        can_id, payload = build_control_cmd_frame(int(mapping.can_id) + int(active_mode), int(cmd))
+        packets: list[bytes] = []
+        for _ in range(DEFAULT_CONTROL_COMMAND_REPEAT):
+            try:
+                packets.append(self._send_with_retry(can_id, payload))
+            except OSError:
+                break
+            time.sleep(DEFAULT_CONTROL_COMMAND_INTERVAL)
+        return b"".join(packets)
+
+    def _validate_motor_id(self, motor_id: int) -> int:
+        valid_ids = self._motor_ids()
+        motor_id = int(motor_id)
+        if motor_id not in valid_ids:
+            raise ValueError(f"motor_id must be within {valid_ids}.")
+        return motor_id
+
+    def _append_feedback_frame(self, can_id: int, payload: bytes) -> None:
+        if len(payload) < 6:
+            return
+        if len(payload) >= 3 and payload[2] in (0x33, 0x55, 0xAA):
+            return
+        mapping = self._feedback_mapping.get(int(can_id))
+        if mapping is None:
+            return
+        try:
+            decoded = decode_feedback(payload, mapping.motor_type)
+        except Exception as exc:
+            raise ValueError(
+                f"feedback_decode_error motor_id={int(mapping.motor_id)} can_id=0x{int(can_id):03X}: {exc}"
+            ) from exc
+        if int(decoded.state_code) not in VALID_FEEDBACK_STATE_CODES:
+            raise ValueError(
+                f"feedback_state_error motor_id={int(mapping.motor_id)} can_id=0x{int(can_id):03X} "
+                f"state=0x{int(decoded.state_code):X}"
+            )
+        frame = DecodedFeedbackFrame(
+            motor_id=int(mapping.motor_id),
+            can_id=int(mapping.can_id),
+            mst_id=int(mapping.mst_id),
+            state=int(decoded.state_code),
+            controller_id=int(decoded.controller_id),
+            position=float(decoded.position),
+            velocity=float(decoded.velocity),
+            torque=float(decoded.torque),
+            mos_temperature=float(decoded.mos_temp),
+            rotor_temperature=float(decoded.rotor_temp),
+        )
+        self._decoded_frames.append(frame)
+        self._pending.extend(
+            SERIALIZED_FEEDBACK_STRUCT.pack(
+                SERIALIZED_FEEDBACK_HEAD,
+                int(frame.motor_id),
+                int(frame.state),
+                float(frame.position),
+                float(frame.velocity),
+                float(frame.torque),
+                float(frame.mos_temperature),
+            )
+        )
+
+    def read(self, size: int) -> bytes:
+        target_size = max(int(size), 1)
+        while len(self._pending) < target_size:
+            packet = self._transport.recv(timeout=float(self._config.read_timeout))
+            if packet is None:
+                break
+            can_id, payload = packet
+            self._append_feedback_frame(int(can_id), bytes(payload))
+        chunk = bytes(self._pending[:target_size])
+        del self._pending[:target_size]
+        return chunk
+
+    def pop_feedback_frame(self) -> DecodedFeedbackFrame | None:
+        if not self._decoded_frames:
+            return None
+        return self._decoded_frames.popleft()
+
+    def motor_type_name(self, motor_id: int) -> str:
+        return self._mapping_for_motor_id(motor_id).motor_type.name
+
+    def motor_limits(self, motor_id: int) -> MotorLimits:
+        return get_motor_limits(self._mapping_for_motor_id(motor_id).motor_type)
+
+    def limit_torque_command(self, motor_id: int, torque: float) -> float:
+        limits = self.motor_limits(motor_id)
+        return float(np.clip(float(torque), -float(limits.tmax), float(limits.tmax)))
+
+    def send_mit_torque(self, motor_id: int, torque: float) -> bytes:
+        if not np.isfinite(float(torque)):
+            raise ValueError("torque must be finite")
+        mapping = self._mapping_for_motor_id(motor_id)
+        packet = bytearray()
+        packet.extend(self._ensure_mode(mapping, Control_Mode.MIT_MODE))
+        limited_torque = self.limit_torque_command(motor_id, float(torque))
+        can_id, payload = build_mit_frame(
+            int(mapping.can_id),
+            mapping.motor_type,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            float(limited_torque),
+        )
+        packet.extend(self._send_with_retry(can_id, payload))
+        return bytes(packet)
+
+    def send_mit_velocity(
+        self,
+        motor_id: int,
+        velocity: float,
+        kd: float,
+        *,
+        kp: float = 0.0,
+        torque_ff: float = 0.0,
+        position: float = 0.0,
+    ) -> bytes:
+        if not np.isfinite(float(velocity)):
+            raise ValueError("velocity must be finite")
+        mapping = self._mapping_for_motor_id(motor_id)
+        packet = bytearray()
+        packet.extend(self._ensure_mode(mapping, Control_Mode.MIT_MODE))
+        limited_torque = self.limit_torque_command(motor_id, float(torque_ff))
+        can_id, payload = build_mit_frame(
+            int(mapping.can_id),
+            mapping.motor_type,
+            float(kp),
+            float(kd),
+            float(position),
+            float(velocity),
+            float(limited_torque),
+        )
+        packet.extend(self._send_with_retry(can_id, payload))
+        self._last_mit_velocity_kd[int(mapping.motor_id)] = float(kd)
+        return bytes(packet)
+
+    def send_velocity_mode(self, motor_id: int, velocity: float) -> bytes:
+        if not np.isfinite(float(velocity)):
+            raise ValueError("velocity must be finite")
+        mapping = self._mapping_for_motor_id(motor_id)
+        packet = bytearray()
+        packet.extend(self._ensure_mode(mapping, Control_Mode.VEL_MODE))
+        can_id, payload = build_vel_frame(int(mapping.can_id), float(velocity))
+        packet.extend(self._send_with_retry(can_id, payload))
+        return bytes(packet)
+
+    def send_zero_command(self, motor_id: int, semantic_mode: str) -> bytes:
+        if semantic_mode == "mit_torque":
+            return self.send_mit_torque(motor_id, 0.0)
+        if semantic_mode == "mit_velocity":
+            kd = float(self._last_mit_velocity_kd.get(int(motor_id), 0.0))
+            return self.send_mit_velocity(motor_id, 0.0, kd, kp=0.0, torque_ff=0.0, position=0.0)
+        if semantic_mode == "velocity_mode":
+            return self.send_velocity_mode(motor_id, 0.0)
+        raise ValueError(f"Unsupported semantic_mode: {semantic_mode}")
+
+    def enable_motor(self, motor_id: int) -> bytes:
+        mapping = self._mapping_for_motor_id(motor_id)
+        packet = bytearray()
+        packet.extend(self._ensure_mode(mapping, self._get_active_mode(mapping)))
+        packet.extend(self._send_control(mapping, ENABLE_CMD))
+        return bytes(packet)
+
+    def disable_motor(self, motor_id: int) -> bytes:
+        mapping = self._mapping_for_motor_id(motor_id)
+        return self._send_control(mapping, DISABLE_CMD)
+
+    def clear_error(self, motor_id: int) -> bytes:
+        mapping = self._mapping_for_motor_id(motor_id)
+        return self._send_control(mapping, CLEAR_ERROR_CMD)
+
+    def send_motor_torque(self, motor_id: int, torque: float) -> bytes:
+        return self.send_mit_torque(motor_id, torque)
+
+    def reset_input_buffer(self) -> None:
+        self._pending.clear()
+        self._decoded_frames.clear()
+        while True:
+            packet = self._transport.recv(timeout=0.0)
+            if packet is None:
+                break
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        try:
+            for mapping in self._motor_mappings:
+                try:
+                    self._send_control(mapping, DISABLE_CMD)
+                except OSError:
+                    continue
+        finally:
+            self._transport.close()
+
+
+def configure_can_interface(interface: str, nominal_bitrate: int, data_bitrate: int) -> None:
+    commands = [
+        ["ip", "link", "set", interface, "down"],
+        ["ip", "link", "set", interface, "type", "can", "bitrate", str(nominal_bitrate), "dbitrate", str(data_bitrate), "fd", "on"],
+        ["ip", "link", "set", interface, "up"],
+    ]
+    for cmd in commands:
+        subprocess.run(cmd, check=True)
+
+
+def ensure_interface_ready(interface: str, nominal_bitrate: int, data_bitrate: int) -> None:
+    path = f"/sys/class/net/{interface}/operstate"
+    if not os.path.exists(path):
+        raise RuntimeError(f"CAN interface {interface} does not exist")
+    with open(path, "r", encoding="utf-8") as file:
+        state = file.read().strip()
+    if state != "up":
+        raise RuntimeError(
+            f"{interface} 当前不是 UP 状态。先执行:\n"
+            f"  sudo ip link set {interface} down\n"
+            f"  sudo ip link set {interface} type can bitrate {nominal_bitrate} dbitrate {data_bitrate} fd on\n"
+            f"  sudo ip link set {interface} up"
+        )
+
+
+def send_frame(transport: SocketCanTransport, frame: tuple[int, bytes]) -> None:
+    can_id, payload = frame
+    backpressure_sleep = DEFAULT_BACKPRESSURE_SLEEP
+    while True:
+        try:
+            transport.send(can_id, payload)
+            return
+        except OSError as exc:
+            if exc.errno != errno.ENOBUFS:
+                raise
+            time.sleep(backpressure_sleep)
+            backpressure_sleep = min(backpressure_sleep * 2.0, MAX_BACKPRESSURE_SLEEP)
+
+
+def send_repeated_frame(transport: SocketCanTransport, frame: tuple[int, bytes], count: int, interval_seconds: float) -> None:
+    for _ in range(int(count)):
+        send_frame(transport, frame)
+        time.sleep(float(interval_seconds))
+
+
+def build_enable_frame(can_id: int) -> tuple[int, bytes]:
+    return build_control_cmd_frame(int(can_id) + Control_Mode.MIT_MODE, ENABLE_CMD)
+
+
+def build_disable_frame(can_id: int) -> tuple[int, bytes]:
+    return build_control_cmd_frame(int(can_id) + Control_Mode.MIT_MODE, DISABLE_CMD)
+
+
+def build_clear_error_frame(can_id: int) -> tuple[int, bytes]:
+    return build_control_cmd_frame(int(can_id) + Control_Mode.MIT_MODE, CLEAR_ERROR_CMD)
+
+
+def build_zero_mit_frame(can_id: int, motor_type: DM_Motor_Type) -> tuple[int, bytes]:
+    return build_mit_frame(int(can_id), motor_type, 0.0, 0.0, 0.0, 0.0, 0.0)
+
+
+def build_feedback_views(base_path: str) -> list:
+    return [
+        rrb.TimeSeriesView(origin="/", contents=[f"{base_path}/position"], name="Position"),
+        rrb.TimeSeriesView(origin="/", contents=[f"{base_path}/velocity"], name="Velocity"),
+        rrb.TimeSeriesView(origin="/", contents=[f"{base_path}/torque"], name="Torque"),
+        rrb.TimeSeriesView(origin="/", contents=[f"{base_path}/state_code"], name="State Code"),
+        rrb.TimeSeriesView(origin="/", contents=[f"{base_path}/send_rate_hz"], name="Send Rate"),
+        rrb.TimeSeriesView(
+            origin="/",
+            contents=[f"{base_path}/mos_temp", f"{base_path}/rotor_temp"],
+            name="Temperatures",
+        ),
+        rrb.TextLogView(origin=f"{base_path}/events", name="Motor Events"),
+    ]
+
+
+def build_rerun_blueprint(base_path: str) -> rrb.Blueprint:
+    return rrb.Blueprint(
+        rrb.Vertical(contents=build_feedback_views(base_path)),
+        collapse_panels=True,
+    )
+
+
+def setup_rerun(base_path: str, application_id: str) -> None:
+    rr.init(application_id, spawn=True, default_blueprint=build_rerun_blueprint(base_path))
+    rr.log(f"{base_path}/position", rr.SeriesLines(colors=[[255, 99, 71]], names=["position"], widths=[2]), static=True)
+    rr.log(f"{base_path}/velocity", rr.SeriesLines(colors=[[30, 144, 255]], names=["velocity"], widths=[2]), static=True)
+    rr.log(f"{base_path}/torque", rr.SeriesLines(colors=[[60, 179, 113]], names=["torque"], widths=[2]), static=True)
+    rr.log(f"{base_path}/state_code", rr.SeriesLines(colors=[[255, 215, 0]], names=["state_code"], widths=[2]), static=True)
+    rr.log(f"{base_path}/send_rate_hz", rr.SeriesLines(colors=[[138, 43, 226]], names=["send_rate_hz"], widths=[2]), static=True)
+    rr.log(f"{base_path}/mos_temp", rr.SeriesLines(colors=[[255, 140, 0]], names=["mos_temp"], widths=[2]), static=True)
+    rr.log(f"{base_path}/rotor_temp", rr.SeriesLines(colors=[[220, 20, 60]], names=["rotor_temp"], widths=[2]), static=True)
+
+
+def log_feedback_to_rerun(base_path: str, elapsed_seconds: float, feedback: MotorFeedback | DecodedFeedbackFrame) -> None:
+    rr.set_time("feedback_time", duration=elapsed_seconds)
+    rr.log(f"{base_path}/position", rr.Scalars([feedback.position]))
+    rr.log(f"{base_path}/velocity", rr.Scalars([feedback.velocity]))
+    rr.log(f"{base_path}/torque", rr.Scalars([feedback.torque]))
+    state_code = getattr(feedback, "state_code", getattr(feedback, "state"))
+    mos_temp = getattr(feedback, "mos_temp", getattr(feedback, "mos_temperature"))
+    rotor_temp = getattr(feedback, "rotor_temp", getattr(feedback, "rotor_temperature"))
+    controller_id = int(getattr(feedback, "controller_id", 0))
+    rr.log(f"{base_path}/state_code", rr.Scalars([state_code]))
+    rr.log(f"{base_path}/mos_temp", rr.Scalars([mos_temp]))
+    rr.log(f"{base_path}/rotor_temp", rr.Scalars([rotor_temp]))
+    state_label = STATE_CODE_LABELS.get(int(state_code), f"unknown_{int(state_code):X}")
+    rr.log(
+        f"{base_path}/events",
+        rr.TextLog(
+            (
+                f"state={state_label} controller_id=0x{controller_id:02X} "
+                f"pos={float(feedback.position):.4f} vel={float(feedback.velocity):.4f} "
+                f"tau={float(feedback.torque):.4f} mos_temp={float(mos_temp):.1f} "
+                f"rotor_temp={float(rotor_temp):.1f}"
+            ),
+            level="INFO",
+        ),
+    )
+
+
+def log_send_rate_to_rerun(base_path: str, elapsed_seconds: float, send_rate_hz: float) -> None:
+    rr.set_time("feedback_time", duration=elapsed_seconds)
+    rr.log(f"{base_path}/send_rate_hz", rr.Scalars([float(send_rate_hz)]))
+
+
+def build_socketcan_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="通过 Linux SocketCAN 直接控制达妙电机")
+    parser.add_argument("--interface", default="can0", help="SocketCAN 接口名，默认 can0")
+    parser.add_argument("--can-id", type=int_auto, required=True, help="电机 CAN ID，例如 0x01")
+    parser.add_argument("--mst-id", type=int_auto, required=True, help="电机反馈 ID，例如 0x11")
+    parser.add_argument("--motor-type", default="DM4310", choices=[member.name for member in DM_Motor_Type], help="电机型号")
+    parser.add_argument("--mode", default="vel", choices=["mit", "pos-vel", "vel", "pos-force"], help="控制模式")
+    parser.add_argument("--vel", type=float, default=2.0, help="速度模式目标值")
+    parser.add_argument("--pos", type=float, default=0.0, help="位置模式目标值")
+    parser.add_argument("--kp", type=float, default=0.0, help="MIT 模式 kp")
+    parser.add_argument("--kd", type=float, default=0.0, help="MIT 模式 kd")
+    parser.add_argument("--tau", type=float, default=0.0, help="MIT 模式力矩")
+    parser.add_argument("--rate", type=float, default=1000.0, help="发送频率，默认 1000Hz")
+    parser.add_argument("--duration", type=float, default=5.0, help="持续时间，单位秒")
+    parser.add_argument("--print-interval", type=float, default=0.2, help="打印反馈间隔，单位秒")
+    parser.add_argument("--nom-bitrate", type=int, default=1000000, help="CAN 仲裁域波特率")
+    parser.add_argument("--data-bitrate", type=int, default=5000000, help="CAN FD 数据域波特率")
+    parser.add_argument("--configure-interface", action="store_true", help="启动前尝试配置并拉起接口")
+    parser.add_argument("--set-zero", action="store_true", help="使能后发送零点设置命令")
+    return parser
+
+
+def socketcan_main(argv: Optional[list[str]] = None) -> int:
+    args = build_socketcan_parser().parse_args(argv)
+    if args.configure_interface:
+        configure_can_interface(args.interface, args.nom_bitrate, args.data_bitrate)
+    ensure_interface_ready(args.interface, args.nom_bitrate, args.data_bitrate)
+    motor = MotorConfig(
+        motor_type=parse_motor_type(args.motor_type),
+        can_id=args.can_id,
+        mst_id=args.mst_id,
+        mode=parse_mode(args.mode),
+    )
+    controller = SocketCanMotorController(args.interface, motor)
+    try:
+        controller.start()
+        controller.enable()
+        if args.set_zero:
+            controller.set_zero_position()
+        period = 1.0 / args.rate
+        end_time = time.perf_counter() + args.duration
+        next_print = time.perf_counter()
+        while RUNNING.is_set() and time.perf_counter() < end_time:
+            loop_start = time.perf_counter()
+            if motor.mode == Control_Mode.VEL_MODE:
+                controller.control_velocity(args.vel)
+            elif motor.mode == Control_Mode.POS_VEL_MODE:
+                controller.control_position_velocity(args.pos, args.vel)
+            elif motor.mode == Control_Mode.MIT_MODE:
+                controller.control_mit(args.kp, args.kd, args.pos, args.vel, args.tau)
+            else:
+                raise RuntimeError("POS_FORCE_MODE 暂未实现直接控制命令")
+            now = time.perf_counter()
+            if now >= next_print:
+                feedback = controller.read_feedback()
+                print(
+                    f"canid={motor.can_id} pos={feedback.position:.4f} "
+                    f"vel={feedback.velocity:.4f} tau={feedback.torque:.4f} "
+                    f"dt={feedback.delta_time:.6f}"
+                )
+                next_print = now + args.print_interval
+            sleep_time = period - (time.perf_counter() - loop_start)
+            if sleep_time > 0:
+                time.sleep(sleep_time)
+    finally:
+        controller.close()
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="持续向 DM8009 id=0x01 发送使能帧并实时监听反馈（默认无明确命令内容时持续发送使能）"
+    )
+    parser.add_argument("--mst-id", type=lambda value: int(value, 0), default=DEFAULT_MST_ID, help="反馈帧 ID，默认 0x11")
+    parser.add_argument(
+        "--mode",
+        default="mit",
+        choices=["mit", "pos-vel", "vel", "pos-force"],
+        help="保留兼容参数；当前脚本仅支持 mit，默认 mit",
+    )
+    parser.add_argument(
+        "--all-modes",
+        action="store_true",
+        help="兼容旧参数；当前默认使能脚本会忽略它",
+    )
+    parser.add_argument("--count", type=int, default=5, help="初始使能帧重复发送次数，默认 5 次")
+    parser.add_argument(
+        "--interval-ms",
+        type=float,
+        default=DEFAULT_COMMAND_INTERVAL_MS,
+        help="默认使能帧发送周期；<=0 表示不主动休眠、尽可能高频发送，默认 0ms",
+    )
+    parser.add_argument("--nom-bitrate", type=int, default=1000000, help="CAN 仲裁域波特率")
+    parser.add_argument("--data-bitrate", type=int, default=5000000, help="CAN FD 数据域波特率")
+    parser.add_argument("--configure-interface", action="store_true", help="启动前尝试配置并拉起接口")
+    parser.add_argument(
+        "--listen-duration",
+        type=float,
+        default=DEFAULT_LISTEN_DURATION,
+        help="连续发送控制帧的时长；<=0 表示一直运行直到 Ctrl+C，默认 0 秒",
+    )
+    parser.add_argument(
+        "--print-interval",
+        type=float,
+        default=DEFAULT_PRINT_INTERVAL,
+        help="终端反馈打印间隔，单位秒；<=0 表示收到反馈就打印，默认 0.1 秒",
+    )
+    parser.add_argument("--dry-run", action="store_true", help="只打印将要发送的帧，不真正发包")
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    if args.mode != "mit":
+        raise RuntimeError("当前脚本仅支持 mit 模式连续使能流")
+    if args.configure_interface:
+        configure_can_interface(DEFAULT_INTERFACE, args.nom_bitrate, args.data_bitrate)
+    if not args.dry_run:
+        ensure_interface_ready(DEFAULT_INTERFACE, args.nom_bitrate, args.data_bitrate)
+    base_path = f"/motor/dm8009_id_{DEFAULT_CAN_ID:02X}"
+    motor_type = DM_Motor_Type[DEFAULT_MOTOR_TYPE]
+    enable_frame = build_enable_frame(DEFAULT_CAN_ID)
+    disable_frame = build_disable_frame(DEFAULT_CAN_ID)
+    duration_label = "forever" if args.listen_duration <= 0 else str(args.listen_duration)
+    print(
+        f"target_motor={DEFAULT_MOTOR_TYPE} can_id=0x{DEFAULT_CAN_ID:02X} "
+        f"mst_id=0x{args.mst_id:02X} interface={DEFAULT_INTERFACE} "
+        f"nominal_bitrate={args.nom_bitrate} data_bitrate={args.data_bitrate} frame_type=canfd_brs "
+        f"control_mode=mit command_interval_ms={args.interval_ms} listen_duration={duration_label} "
+        f"default_behavior=enable_only"
+    )
+    if args.all_modes:
+        print("warning: --all-modes is ignored in continuous enable mode")
+    print(f"enable_frame id=0x{enable_frame[0]:03X} data={enable_frame[1].hex()}")
+    print("default_command=enable_only")
+    if args.dry_run:
+        return 0
+    setup_rerun(base_path, application_id="dm8009_enable_feedback")
+    transport = SocketCanTransport(DEFAULT_INTERFACE)
+    start_time = time.monotonic()
+    end_time = None if args.listen_duration <= 0 else start_time + args.listen_duration
+    command_interval_seconds = args.interval_ms / 1000.0 if args.interval_ms > 0 else None
+    last_state_code = None
+    next_feedback_print_at = start_time
+    last_send_rate_log_time = start_time
+    sends_since_rate_log = 0
+    try:
+        send_repeated_frame(transport, enable_frame, args.count, 0.002)
+        while RUNNING.is_set() and (end_time is None or time.monotonic() < end_time):
+            loop_start = time.perf_counter()
+            send_frame(transport, enable_frame)
+            sends_since_rate_log += 1
+            loop_time = time.monotonic()
+            send_rate_window = loop_time - last_send_rate_log_time
+            if send_rate_window >= DEFAULT_SEND_RATE_LOG_INTERVAL:
+                log_send_rate_to_rerun(base_path, loop_time - start_time, sends_since_rate_log / send_rate_window)
+                last_send_rate_log_time = loop_time
+                sends_since_rate_log = 0
+            while True:
+                packet = transport.recv(timeout=0.0)
+                if packet is None:
+                    break
+                can_id, payload = packet
+                if can_id != args.mst_id:
+                    continue
+                feedback = decode_feedback(payload, motor_type)
+                feedback_time = time.monotonic()
+                log_feedback_to_rerun(base_path, feedback_time - start_time, feedback)
+                state_label = STATE_CODE_LABELS.get(feedback.state_code, f"unknown_{feedback.state_code:X}")
+                if feedback.state_code != last_state_code:
+                    print(f"feedback_state={state_label} controller_id=0x{feedback.controller_id:02X}")
+                    last_state_code = feedback.state_code
+                if args.print_interval <= 0 or feedback_time >= next_feedback_print_at:
+                    print(
+                        f"feedback pos={feedback.position:.4f} vel={feedback.velocity:.4f} "
+                        f"tau={feedback.torque:.4f} mos={feedback.mos_temp:.1f} rotor={feedback.rotor_temp:.1f}"
+                    )
+                    if args.print_interval > 0:
+                        next_feedback_print_at = feedback_time + args.print_interval
+            if command_interval_seconds is not None:
+                sleep_time = command_interval_seconds - (time.perf_counter() - loop_start)
+                if sleep_time > 0:
+                    time.sleep(sleep_time)
+    finally:
+        try:
+            send_repeated_frame(transport, disable_frame, args.count, 0.002)
+        except OSError:
+            pass
+        transport.close()
+    return 0
+
+
+__all__ = [
+    "CAN_MTU",
+    "CANFD_MTU",
+    "CANFD_BRS",
+    "CLEAR_ERROR_CMD",
+    "Control_Mode",
+    "Control_Mode_Code",
+    "DM_Motor_Type",
+    "DamiaoSocketCanTransport",
+    "DecodedFeedbackFrame",
+    "DEFAULT_BACKPRESSURE_SLEEP",
+    "DEFAULT_CAN_ID",
+    "DEFAULT_COMMAND_INTERVAL_MS",
+    "DEFAULT_INTERFACE",
+    "DEFAULT_LISTEN_DURATION",
+    "DEFAULT_MOTOR_TYPE",
+    "DEFAULT_MST_ID",
+    "DEFAULT_PRINT_INTERVAL",
+    "ENABLE_CMD",
+    "DISABLE_CMD",
+    "LIMIT_PARAM",
+    "MAX_BACKPRESSURE_SLEEP",
+    "MotorConfig",
+    "MotorFeedback",
+    "RUNNING",
+    "SERIALIZED_FEEDBACK_HEAD",
+    "SERIALIZED_FEEDBACK_STRUCT",
+    "SocketCanMotorController",
+    "SocketCanTransport",
+    "STATE_CODE_LABELS",
+    "VALID_FEEDBACK_STATE_CODES",
+    "build_control_cmd_frame",
+    "build_clear_error_frame",
+    "build_disable_frame",
+    "build_enable_frame",
+    "build_feedback_views",
+    "build_mit_frame",
+    "build_param_read_frame",
+    "build_param_write_frame",
+    "build_parser",
+    "build_pos_vel_frame",
+    "build_rerun_blueprint",
+    "build_socketcan_parser",
+    "build_vel_frame",
+    "build_zero_mit_frame",
+    "configure_can_interface",
+    "decode_feedback",
+    "ensure_interface_ready",
+    "int_auto",
+    "log_feedback_to_rerun",
+    "log_send_rate_to_rerun",
+    "main",
+    "mode_to_code",
+    "get_motor_limits",
+    "MotorLimits",
+    "MOTOR_LIMITS",
+    "pack_can_frame",
+    "pack_canfd_frame",
+    "parse_mode",
+    "parse_motor_type",
+    "send_frame",
+    "send_repeated_frame",
+    "setup_rerun",
+    "socketcan_main",
+    "uint_to_float",
+    "unpack_can_packet",
+]
+
 
 if __name__ == "__main__":
     try:
-        init_data1= []
-        init_data2 = []
-        canid1=0x01
-        mstid1=0x11
-        canid2=0x02
-        mstid2=0x12
-        canid3=0x03
-        mstid3=0x13
-        canid4=0x04
-        mstid4=0x14
-        canid5=0x05
-        mstid5=0x15
-        canid6=0x06
-        mstid6=0x16
-        canid7=0x07
-        mstid7=0x17
-        canid8=0x08
-        mstid8=0x18
-        canid9=0x09
-        mstid9=0x19
-        init_data1.append(DmActData(
-                    motorType=DM_Motor_Type.DM4310,  # 或者具体类型，如 DM_Motor_Type.DM4310
-                    mode=Control_Mode.POS_VEL_MODE,        # 如 Control_Mode.MIT_MODE
-                    can_id=canid1,
-                    mst_id=mstid1))
-        # init_data1.append(DmActData(
-        #             motorType=DM_Motor_Type.DM4310,  # 或者具体类型，如 DM_Motor_Type.DM4310
-        #             mode=Control_Mode.POS_VEL_MODE,        # 如 Control_Mode.MIT_MODE
-        #             can_id=canid2,
-        #             mst_id=mstid2))
-        # init_data1.append(DmActData(
-        #             motorType=DM_Motor_Type.DM4310,  # 或者具体类型，如 DM_Motor_Type.DM4310
-        #             mode=Control_Mode.POS_VEL_MODE,        # 如 Control_Mode.MIT_MODE
-        #             can_id=canid3,
-        #             mst_id=mstid3))
-        # init_data1.append(DmActData(
-        #             motorType=DM_Motor_Type.DM4340,  # 或者具体类型，如 DM_Motor_Type.DM4310
-        #             mode=Control_Mode.POS_VEL_MODE,        # 如 Control_Mode.MIT_MODE
-        #             can_id=canid4,
-        #             mst_id=mstid4))
-        # init_data1.append(DmActData(
-        #             motorType=DM_Motor_Type.DM4340,  # 或者具体类型，如 DM_Motor_Type.DM4310
-        #             mode=Control_Mode.POS_VEL_MODE,        # 如 Control_Mode.MIT_MODE
-        #             can_id=canid5,
-        #             mst_id=mstid5))
-        # init_data1.append(DmActData(
-        #             motorType=DM_Motor_Type.DM4340,  # 或者具体类型，如 DM_Motor_Type.DM4310
-        #             mode=Control_Mode.POS_VEL_MODE,        # 如 Control_Mode.MIT_MODE
-        #             can_id=canid6,
-        #             mst_id=mstid6))
-        # init_data1.append(DmActData(
-        #             motorType=DM_Motor_Type.DM4310,  # 或者具体类型，如 DM_Motor_Type.DM4310
-        #             mode=Control_Mode.POS_VEL_MODE,        # 如 Control_Mode.MIT_MODE
-        #             can_id=canid7,
-        #             mst_id=mstid7))
-        # init_data1.append(DmActData(
-        #             motorType=DM_Motor_Type.DM4310,  # 或者具体类型，如 DM_Motor_Type.DM4310
-        #             mode=Control_Mode.POS_VEL_MODE,        # 如 Control_Mode.MIT_MODE
-        #             can_id=canid8,
-        #             mst_id=mstid8))
-        # init_data1.append(DmActData(
-        #             motorType=DM_Motor_Type.DM4310,  # 或者具体类型，如 DM_Motor_Type.DM4310
-        #             mode=Control_Mode.POS_VEL_MODE,        # 如 Control_Mode.MIT_MODE
-        #             can_id=canid9,
-        #             mst_id=mstid9))
-        # init_data2.append(DmActData(
-        #             motorType=DM_Motor_Type.DM4310,  # 或者具体类型，如 DM_Motor_Type.DM4310
-        #             mode=Control_Mode.POS_VEL_MODE,        # 如 Control_Mode.MIT_MODE
-        #             can_id=canid2,
-        #             mst_id=mstid2))
-
-        #with Motor_Control(1000000, 5000000,"14AA044B241402B10DDBDAFE448040BB",init_data1) as control\
-        #       ,Motor_Control(1000000, 5000000, "AA96DF2EC013B46B1BE4613798544085", init_data2) as control2:
-        with Motor_Control(1000000, 5000000,"2A31BAF2FB0DE4A35B8FCF38FECC3603",init_data1) as control:
-        #control=Motor_Control(1000000, 5000000,"14AA044B241402B10DDBDAFE448040BB",init_data1) 
-            while running.is_set():
-                    desired_duration = 0.001  # 秒
-                    current_time = time.perf_counter()
-                    # kp: float, kd: float, q: float, dq: float, tau: float)
-                    # control.control_mit(control.getMotor(canid1), 0.0, 0.0, 0.0, 0.0, 0.0)
-                    # control.control_mit(control.getMotor(canid2), 0.0, 0.0, 0.0, 0.0, 0.0)
-                    # control.control_mit(control.getMotor(canid3), 0.0, 0.0, 0.0, 0.0, 0.0)
-                    # control.control_mit(control.getMotor(canid4), 0.0, 0.0, 0.0, 0.0, 0.0)
-                    # control.control_mit(control.getMotor(canid5), 0.0, 0.0, 0.0, 0.0, 0.0)
-                    #control.control_mit(control.getMotor(canid6), 0.0, 0.0, 0.0, 0.0, 0.0)
-                    # control.control_mit(control.getMotor(canid7), 0.0, 0.0, 0.0, 0.0, 0.0)
-                    # control.control_mit(control.getMotor(canid8), 0.0, 0.0, 0.0, 0.0, 0.0)
-                    # control.control_mit(control.getMotor(canid9), 0.0, 0.0, 0.0, 0.0, 0.0)
-                    
-                    control.control_vel(control.getMotor(canid1), 2.0)
-                    for id in range(1): 
-                        pos = control.getMotor(canid1).Get_Position()
-                        vel = control.getMotor(canid1).Get_Velocity()
-                        tau = control.getMotor(canid1).Get_tau()
-                        interval = control.getMotor(canid1).getTimeInterval()
-
-                        print(f"canid is: {canid1} pos: {pos} vel: {vel} effort: {tau} time(s): {interval}", file=sys.stderr)
-
-                    #control2.control_vel(control2.getMotor(canid2), -3.0)
-                    #control.enable_all()
-                    sleep_till = current_time + desired_duration
-                    now = time.perf_counter()
-                    if sleep_till > now:
-                        time.sleep(sleep_till - now)
-                    
-            print("The program exited safely.") 
-    except Exception as e:
-        print(f"Error: hardware interface exception: {e}", file=sys.stderr)
-    finally:
-        #control.close()
-        #control2.close()
-        pass
+        raise SystemExit(main())
+    except RuntimeError as exc:
+        print(exc, file=sys.stderr)
+        raise SystemExit(1) from None
+    except subprocess.CalledProcessError as exc:
+        print(f"命令执行失败: {' '.join(exc.cmd)}", file=sys.stderr)
+        raise SystemExit(exc.returncode) from None
