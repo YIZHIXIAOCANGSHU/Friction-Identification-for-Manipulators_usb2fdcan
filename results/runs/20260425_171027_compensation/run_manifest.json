@@ -1,0 +1,15 @@
+{
+  "run_label": "20260425_171027_compensation",
+  "mode": "compensation",
+  "start_time": "2026-04-25T09:10:27+00:00",
+  "end_time": null,
+  "repeat_count": 3,
+  "motor_order": [
+    2
+  ],
+  "capture_files": [],
+  "identification_files": [],
+  "summary_files": {},
+  "rerun_recording_path": "/home/luwen/桌面/参数_usb2fdcan/results/runs/20260425_171027_compensation/compensation.rrd",
+  "config_path": "/home/luwen/桌面/参数_usb2fdcan/friction_identification_core/default.yaml"
+}

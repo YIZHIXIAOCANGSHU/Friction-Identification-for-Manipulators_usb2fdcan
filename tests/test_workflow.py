@@ -200,6 +200,167 @@ class ClosedLoopFakeTransport:
         return float(np.clip(float(torque), -self._torque_limit, self._torque_limit))
 
 
+class CoastingBreakawayFakeTransport(ClosedLoopFakeTransport):
+    def __init__(
+        self,
+        motor_ids: tuple[int, ...],
+        *,
+        initial_velocity_by_motor: dict[int, float] | None = None,
+    ) -> None:
+        super().__init__(
+            motor_ids,
+            dt=0.005,
+            static_threshold=0.12,
+            tau_c=0.0,
+            tau_bias=0.0,
+            viscous=0.0,
+            inertia=1.0,
+            velocity_gain=3.5,
+            initial_velocity_by_motor=initial_velocity_by_motor,
+        )
+
+    def _advance_motor(self, motor_id: int) -> tuple[int, float, float, float, float]:
+        item = self._state[int(motor_id)]
+        velocity = float(item["velocity"])
+        position = float(item["position"])
+        if not bool(item["enabled"]):
+            velocity *= 0.7
+            torque_feedback = 0.0
+            state = 0
+        else:
+            state = 1
+            mode = str(item["mode"])
+            if mode == "mit_torque":
+                applied_torque = float(item["torque_cmd"])
+                if abs(applied_torque) >= self._static_threshold:
+                    velocity = 0.7 * float(np.sign(applied_torque))
+                else:
+                    # Simulate a lightly damped motor that coasts for too long if we only release torque.
+                    velocity *= 0.995
+            else:
+                target_velocity = float(item["velocity_cmd"])
+                velocity += 0.65 * (target_velocity - velocity)
+                applied_torque = velocity - target_velocity
+            torque_feedback = float(applied_torque)
+            position += self._dt * velocity
+        item["position"] = float(position)
+        item["velocity"] = float(velocity)
+        item["torque_feedback"] = float(torque_feedback)
+        return state, float(position), float(velocity), float(torque_feedback), 30.0 + float(motor_id)
+
+
+class MissingFeedbackMotorFakeTransport(ClosedLoopFakeTransport):
+    def __init__(self, motor_ids: tuple[int, ...], *, missing_motor_ids: tuple[int, ...]) -> None:
+        super().__init__(motor_ids)
+        self._missing_motor_ids = {int(motor_id) for motor_id in missing_motor_ids}
+
+    def _build_cycle_bytes(self) -> bytes:
+        frames = bytearray()
+        for motor_id in self._motor_ids:
+            state, position, velocity, torque_feedback, mos_temperature = self._advance_motor(int(motor_id))
+            if int(motor_id) in self._missing_motor_ids:
+                continue
+            frames.extend(
+                RECV_FRAME_STRUCT.pack(
+                    RECV_FRAME_HEAD,
+                    int(motor_id),
+                    int(state),
+                    float(position),
+                    float(velocity),
+                    float(torque_feedback),
+                    float(mos_temperature),
+                )
+            )
+        return bytes(frames)
+
+
+class CommandTriggeredFeedbackFakeTransport(ClosedLoopFakeTransport):
+    def __init__(self, motor_ids: tuple[int, ...], **kwargs) -> None:  # noqa: ANN003
+        super().__init__(motor_ids, **kwargs)
+        self._feedback_budget = 0
+
+    def _grant_feedback(self) -> None:
+        self._feedback_budget += 1
+
+    def read(self, size: int) -> bytes:
+        if self._feedback_budget <= 0:
+            return b""
+        self._feedback_budget -= 1
+        return super().read(size)
+
+    def send_mit_torque(self, motor_id: int, torque: float) -> bytes:
+        self._grant_feedback()
+        return super().send_mit_torque(motor_id, torque)
+
+    def send_mit_velocity(
+        self,
+        motor_id: int,
+        velocity: float,
+        kd: float,
+        *,
+        kp: float = 0.0,
+        torque_ff: float = 0.0,
+        position: float = 0.0,
+    ) -> bytes:
+        self._grant_feedback()
+        return super().send_mit_velocity(
+            motor_id,
+            velocity,
+            kd,
+            kp=kp,
+            torque_ff=torque_ff,
+            position=position,
+        )
+
+    def send_velocity_mode(self, motor_id: int, velocity: float) -> bytes:
+        self._grant_feedback()
+        return super().send_velocity_mode(motor_id, velocity)
+
+
+class StaticBreakawayAssistFakeTransport(ClosedLoopFakeTransport):
+    def __init__(
+        self,
+        motor_ids: tuple[int, ...],
+        *,
+        external_push_torque: float = 0.25,
+    ) -> None:
+        super().__init__(
+            motor_ids,
+            dt=0.005,
+            static_threshold=0.5,
+            tau_c=0.0,
+            tau_bias=0.0,
+            viscous=0.0,
+            inertia=0.2,
+            velocity_gain=1.0,
+        )
+        self._external_push_torque = float(external_push_torque)
+
+    def _advance_motor(self, motor_id: int) -> tuple[int, float, float, float, float]:
+        item = self._state[int(motor_id)]
+        velocity = float(item["velocity"])
+        position = float(item["position"])
+        if not bool(item["enabled"]):
+            velocity *= 0.7
+            torque_feedback = 0.0
+            state = 0
+        else:
+            state = 1
+            applied_torque = float(item["torque_cmd"])
+            if abs(velocity) < 0.02 and abs(applied_torque) < self._static_threshold:
+                velocity = 0.0
+                torque_feedback = float(self._external_push_torque)
+            else:
+                torque_feedback = float(applied_torque)
+                acceleration = (applied_torque - 0.05 * np.sign(applied_torque)) / self._inertia
+                velocity += self._dt * acceleration
+            position += self._dt * velocity
+        item["position"] = float(position)
+        item["velocity"] = float(velocity)
+        item["torque_feedback"] = float(torque_feedback)
+        return state, float(position), float(velocity), float(torque_feedback), 30.0 + float(motor_id)
+
+
 class WorkflowTests(unittest.TestCase):
     def _base_config(self):
         return load_config(DEFAULT_CONFIG_PATH)
@@ -428,6 +589,144 @@ class WorkflowTests(unittest.TestCase):
             self.assertEqual(identification_files, [])
             self.assertTrue(any(kind == "mit_torque" and abs(value) > 0.0 for kind, _, value in transport.writes))
 
+    def test_compensation_sends_heartbeat_commands_when_feedback_requires_commands(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            base_config = self._base_config()
+            latest_path = Path(tmpdir) / "latest_motor_parameters.json"
+            latest_path.write_text(
+                json.dumps(
+                    {
+                        "updated_at": "2026-04-25T00:00:00+00:00",
+                        "results_dir": str(Path(tmpdir)),
+                        "speed_limit_rad_s": 10.0,
+                        "motors": {
+                            "1": {
+                                "motor_id": 1,
+                                "motor_name": "motor_01",
+                                "identified_at": "2026-04-25T00:00:00+00:00",
+                                "source_run_label": "seed_run",
+                                "tau_static": 0.12,
+                                "tau_bias": 0.01,
+                                "tau_c": 0.18,
+                                "viscous": 0.04,
+                                "inertia": 0.08,
+                                "friction_validation_rmse": 0.01,
+                                "inertia_validation_rmse": 0.02,
+                                "repeat_consistency_score": 0.03,
+                                "recommended_for_compensation": False,
+                            }
+                        },
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+            config = replace(
+                base_config,
+                motors=replace(base_config.motors, enabled_ids=(1,)),
+                transport=replace(
+                    base_config.transport,
+                    read_timeout=0.001,
+                    read_chunk_size=RECV_FRAME_STRUCT.size * len(base_config.motor_ids),
+                    sync_timeout=0.05,
+                ),
+                safety=replace(
+                    base_config.safety,
+                    moving_hold_ms=5,
+                    post_abort_disable_delay_ms=10,
+                ),
+                identification=replace(
+                    base_config.identification,
+                    savgol_window=9,
+                    savgol_polyorder=2,
+                ),
+                output=replace(base_config.output, results_dir=Path(tmpdir)),
+            )
+            transport = CommandTriggeredFeedbackFakeTransport(
+                motor_ids=base_config.motor_ids,
+                initial_velocity_by_motor={1: 1.0},
+            )
+
+            result = run_compensation(
+                config,
+                transport_factory=lambda: transport,
+                show_rerun_viewer=False,
+                max_runtime_s=0.05,
+            )
+
+            with np.load(result.artifacts[0], allow_pickle=False) as capture:
+                self.assertGreater(int(capture["time"].size), 0)
+                self.assertTrue(np.any(np.abs(capture["command"]) > 0.0))
+
+    def test_compensation_uses_tau_static_assist_from_feedback_torque_near_zero_speed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            base_config = self._base_config()
+            latest_path = Path(tmpdir) / "latest_motor_parameters.json"
+            latest_path.write_text(
+                json.dumps(
+                    {
+                        "updated_at": "2026-04-25T00:00:00+00:00",
+                        "results_dir": str(Path(tmpdir)),
+                        "speed_limit_rad_s": 10.0,
+                        "motors": {
+                            "1": {
+                                "motor_id": 1,
+                                "motor_name": "motor_01",
+                                "identified_at": "2026-04-25T00:00:00+00:00",
+                                "source_run_label": "seed_run",
+                                "tau_static": 0.60,
+                                "tau_bias": 0.0,
+                                "tau_c": 0.12,
+                                "viscous": 0.0,
+                                "inertia": 0.0,
+                                "friction_validation_rmse": 0.01,
+                                "inertia_validation_rmse": 0.02,
+                                "repeat_consistency_score": 0.03,
+                                "recommended_for_compensation": True,
+                            }
+                        },
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+            config = replace(
+                base_config,
+                motors=replace(base_config.motors, enabled_ids=(1,)),
+                transport=replace(
+                    base_config.transport,
+                    read_timeout=0.001,
+                    read_chunk_size=RECV_FRAME_STRUCT.size * len(base_config.motor_ids),
+                    sync_timeout=0.05,
+                ),
+                safety=replace(
+                    base_config.safety,
+                    moving_hold_ms=5,
+                    post_abort_disable_delay_ms=10,
+                    moving_velocity_threshold=0.2,
+                ),
+                identification=replace(
+                    base_config.identification,
+                    savgol_window=9,
+                    savgol_polyorder=2,
+                ),
+                output=replace(base_config.output, results_dir=Path(tmpdir)),
+            )
+            transport = StaticBreakawayAssistFakeTransport(motor_ids=base_config.motor_ids)
+
+            result = run_compensation(
+                config,
+                transport_factory=lambda: transport,
+                show_rerun_viewer=False,
+                max_runtime_s=0.05,
+            )
+
+            with np.load(result.artifacts[0], allow_pickle=False) as capture:
+                self.assertGreater(float(np.max(capture["command"])), 0.5)
+                self.assertGreater(float(np.max(capture["velocity"])), 0.0)
+
     def test_breakaway_hard_abort_sends_zero_then_disable(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             base_config = self._base_config()
@@ -466,6 +765,105 @@ class WorkflowTests(unittest.TestCase):
         self.assertTrue(transport.closed)
         self.assertGreaterEqual(transport.zero_command_count, 5)
         self.assertGreaterEqual(transport.disable_count, 1)
+
+    def test_breakaway_uses_active_velocity_settle_between_directions(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            base_config = self._base_config()
+            config = replace(
+                base_config,
+                motors=replace(base_config.motors, enabled_ids=(1,)),
+                transport=replace(
+                    base_config.transport,
+                    read_timeout=0.001,
+                    read_chunk_size=RECV_FRAME_STRUCT.size * len(base_config.motor_ids),
+                    sync_timeout=0.04,
+                ),
+                safety=replace(
+                    base_config.safety,
+                    moving_hold_ms=5,
+                    post_abort_disable_delay_ms=10,
+                ),
+                breakaway=replace(
+                    base_config.breakaway,
+                    torque_step=0.04,
+                    hold_duration=0.01,
+                    scan_max_torque=np.asarray([0.20, 0.80, 0.60, 0.60, 0.40, 0.40, 0.40], dtype=np.float64),
+                ),
+                identification=replace(base_config.identification, repeat_count=1),
+                output=replace(base_config.output, results_dir=Path(tmpdir)),
+            )
+            transport = CoastingBreakawayFakeTransport(motor_ids=base_config.motor_ids)
+
+            result = run_breakaway(config, transport_factory=lambda: transport, show_rerun_viewer=False)
+
+            self.assertTrue(transport.closed)
+            self.assertEqual(len(result.artifacts), 1)
+            self.assertTrue(any(kind == "mit_velocity" for kind, _, _ in transport.writes))
+
+    def test_precheck_uses_active_velocity_settle_for_coasting_motor(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            base_config = self._base_config()
+            config = replace(
+                base_config,
+                motors=replace(base_config.motors, enabled_ids=(1,)),
+                transport=replace(
+                    base_config.transport,
+                    read_timeout=0.001,
+                    read_chunk_size=RECV_FRAME_STRUCT.size * len(base_config.motor_ids),
+                    sync_timeout=0.04,
+                ),
+                safety=replace(
+                    base_config.safety,
+                    moving_hold_ms=5,
+                    post_abort_disable_delay_ms=10,
+                ),
+                breakaway=replace(
+                    base_config.breakaway,
+                    torque_step=0.04,
+                    hold_duration=0.01,
+                    scan_max_torque=np.asarray([0.20, 0.80, 0.60, 0.60, 0.40, 0.40, 0.40], dtype=np.float64),
+                ),
+                identification=replace(base_config.identification, repeat_count=1),
+                output=replace(base_config.output, results_dir=Path(tmpdir)),
+            )
+            transport = CoastingBreakawayFakeTransport(
+                motor_ids=base_config.motor_ids,
+                initial_velocity_by_motor={1: 1.0},
+            )
+
+            result = run_breakaway(config, transport_factory=lambda: transport, show_rerun_viewer=False)
+
+            self.assertTrue(transport.closed)
+            self.assertEqual(len(result.artifacts), 1)
+            first_enable_index = next(index for index, (kind, _, _) in enumerate(transport.writes) if kind == "enable")
+            self.assertEqual(transport.writes[first_enable_index + 1][0], "mit_velocity")
+
+    def test_precheck_reports_feedback_timeout_when_target_motor_is_silent(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            base_config = self._base_config()
+            config = replace(
+                base_config,
+                motors=replace(base_config.motors, enabled_ids=(6,)),
+                transport=replace(
+                    base_config.transport,
+                    read_timeout=0.001,
+                    read_chunk_size=RECV_FRAME_STRUCT.size * len(base_config.motor_ids),
+                    sync_timeout=0.04,
+                ),
+                safety=replace(
+                    base_config.safety,
+                    moving_hold_ms=5,
+                    post_abort_disable_delay_ms=10,
+                ),
+                output=replace(base_config.output, results_dir=Path(tmpdir)),
+            )
+            transport = MissingFeedbackMotorFakeTransport(
+                motor_ids=base_config.motor_ids,
+                missing_motor_ids=(6,),
+            )
+
+            with self.assertRaisesRegex(RuntimeError, r"reason=feedback_timeout"):
+                run_breakaway(config, transport_factory=lambda: transport, show_rerun_viewer=False)
 
 
 if __name__ == "__main__":

@@ -2,7 +2,7 @@
   "run_label": "20260425_155213_identify-all",
   "mode": "identify-all",
   "start_time": "2026-04-25T07:52:13+00:00",
-  "end_time": null,
+  "end_time": "2026-04-25T08:06:27+00:00",
   "repeat_count": 3,
   "motor_order": [
     1,
@@ -14,12 +14,43 @@
     7
   ],
   "capture_files": [
-    "/home/luwen/桌面/参数_usb2fdcan/results/runs/20260425_155213_identify-all/group_01/motor_01/capture.npz"
+    "/home/luwen/桌面/参数_usb2fdcan/results/runs/20260425_155213_identify-all/group_01/motor_01/capture.npz",
+    "/home/luwen/桌面/参数_usb2fdcan/results/runs/20260425_155213_identify-all/group_01/motor_02/capture.npz",
+    "/home/luwen/桌面/参数_usb2fdcan/results/runs/20260425_155213_identify-all/group_01/motor_03/capture.npz",
+    "/home/luwen/桌面/参数_usb2fdcan/results/runs/20260425_155213_identify-all/group_01/motor_04/capture.npz",
+    "/home/luwen/桌面/参数_usb2fdcan/results/runs/20260425_155213_identify-all/group_01/motor_05/capture.npz",
+    "/home/luwen/桌面/参数_usb2fdcan/results/runs/20260425_155213_identify-all/group_01/motor_06/capture.npz",
+    "/home/luwen/桌面/参数_usb2fdcan/results/runs/20260425_155213_identify-all/group_01/motor_07/capture.npz",
+    "/home/luwen/桌面/参数_usb2fdcan/results/runs/20260425_155213_identify-all/group_02/motor_01/capture.npz",
+    "/home/luwen/桌面/参数_usb2fdcan/results/runs/20260425_155213_identify-all/group_02/motor_02/capture.npz",
+    "/home/luwen/桌面/参数_usb2fdcan/results/runs/20260425_155213_identify-all/group_02/motor_03/capture.npz",
+    "/home/luwen/桌面/参数_usb2fdcan/results/runs/20260425_155213_identify-all/group_02/motor_04/capture.npz",
+    "/home/luwen/桌面/参数_usb2fdcan/results/runs/20260425_155213_identify-all/group_02/motor_05/capture.npz"
   ],
   "identification_files": [
-    "/home/luwen/桌面/参数_usb2fdcan/results/runs/20260425_155213_identify-all/group_01/motor_01/identification.npz"
+    "/home/luwen/桌面/参数_usb2fdcan/results/runs/20260425_155213_identify-all/group_01/motor_01/identification.npz",
+    "/home/luwen/桌面/参数_usb2fdcan/results/runs/20260425_155213_identify-all/group_01/motor_02/identification.npz",
+    "/home/luwen/桌面/参数_usb2fdcan/results/runs/20260425_155213_identify-all/group_01/motor_03/identification.npz",
+    "/home/luwen/桌面/参数_usb2fdcan/results/runs/20260425_155213_identify-all/group_01/motor_04/identification.npz",
+    "/home/luwen/桌面/参数_usb2fdcan/results/runs/20260425_155213_identify-all/group_01/motor_05/identification.npz",
+    "/home/luwen/桌面/参数_usb2fdcan/results/runs/20260425_155213_identify-all/group_01/motor_06/identification.npz",
+    "/home/luwen/桌面/参数_usb2fdcan/results/runs/20260425_155213_identify-all/group_01/motor_07/identification.npz",
+    "/home/luwen/桌面/参数_usb2fdcan/results/runs/20260425_155213_identify-all/group_02/motor_01/identification.npz",
+    "/home/luwen/桌面/参数_usb2fdcan/results/runs/20260425_155213_identify-all/group_02/motor_02/identification.npz",
+    "/home/luwen/桌面/参数_usb2fdcan/results/runs/20260425_155213_identify-all/group_02/motor_03/identification.npz",
+    "/home/luwen/桌面/参数_usb2fdcan/results/runs/20260425_155213_identify-all/group_02/motor_04/identification.npz",
+    "/home/luwen/桌面/参数_usb2fdcan/results/runs/20260425_155213_identify-all/group_02/motor_05/identification.npz"
   ],
   "summary_files": {},
   "rerun_recording_path": "/home/luwen/桌面/参数_usb2fdcan/results/runs/20260425_155213_identify-all/identify-all.rrd",
-  "config_path": "/home/luwen/桌面/参数_usb2fdcan/friction_identification_core/default.yaml"
+  "config_path": "/home/luwen/桌面/参数_usb2fdcan/friction_identification_core/default.yaml",
+  "abort_event": {
+    "reason": "stationary_timeout",
+    "stage": "breakaway",
+    "motor_id": 6,
+    "group_index": 2,
+    "round_index": 13,
+    "phase_name": "breakaway_neg_settle",
+    "detail": "timeout_s=2.000"
+  }
 }

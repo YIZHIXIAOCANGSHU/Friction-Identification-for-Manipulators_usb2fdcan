@@ -1,0 +1,26 @@
+{
+  "run_label": "20260425_192000_compensation",
+  "mode": "compensation",
+  "start_time": "2026-04-25T11:20:00+00:00",
+  "end_time": "2026-04-25T11:20:07+00:00",
+  "repeat_count": 3,
+  "motor_order": [
+    1
+  ],
+  "capture_files": [],
+  "identification_files": [],
+  "summary_files": {},
+  "rerun_recording_path": "/home/luwen/桌面/参数_usb2fdcan/results/runs/20260425_192000_compensation/compensation.rrd",
+  "config_path": "/home/luwen/桌面/参数_usb2fdcan/friction_identification_core/default.yaml",
+  "abort_event": {
+    "reason": "hard_speed_abort",
+    "stage": "compensation",
+    "motor_id": 1,
+    "group_index": 1,
+    "round_index": 1,
+    "phase_name": "compensation_active",
+    "observed_velocity": 12.318681318681314,
+    "velocity_limit": 10.0,
+    "detail": "abs_velocity=12.318681"
+  }
+}

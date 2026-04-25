@@ -285,13 +285,65 @@ def _compensation_torque(
     *,
     filtered_velocity: float,
     acceleration: float,
-) -> float:
-    return float(
-        float(parameters.tau_c) * float(np.sign(float(filtered_velocity)))
+    feedback_torque: float,
+    last_direction: float,
+    config: Config,
+) -> tuple[float, float]:
+    feedback_torque_epsilon = max(
+        0.1 * max(abs(float(parameters.tau_static)), abs(float(parameters.tau_c))),
+        1.0e-3,
+    )
+    direction = _compensation_direction(
+        filtered_velocity=float(filtered_velocity),
+        acceleration=float(acceleration),
+        feedback_torque=float(feedback_torque),
+        feedback_torque_epsilon=float(feedback_torque_epsilon),
+        last_direction=float(last_direction),
+        config=config,
+    )
+    friction_level = _compensation_friction_level(
+        parameters,
+        filtered_velocity=float(filtered_velocity),
+        config=config,
+    )
+    torque = (
+        float(direction) * float(friction_level)
         + float(parameters.viscous) * float(filtered_velocity)
         + float(parameters.tau_bias)
         + float(parameters.inertia) * float(acceleration)
     )
+    return float(torque), float(direction)
+
+
+def _compensation_direction(
+    *,
+    filtered_velocity: float,
+    acceleration: float,
+    feedback_torque: float,
+    feedback_torque_epsilon: float,
+    last_direction: float,
+    config: Config,
+) -> float:
+    velocity_epsilon = max(min(float(config.safety.moving_velocity_threshold), 0.05), 1.0e-3)
+    acceleration_epsilon = 1.0e-2
+    if abs(float(filtered_velocity)) >= velocity_epsilon:
+        return float(np.sign(float(filtered_velocity)))
+    if abs(float(feedback_torque)) >= feedback_torque_epsilon:
+        return float(np.sign(float(feedback_torque)))
+    if abs(float(acceleration)) >= acceleration_epsilon:
+        return float(np.sign(float(acceleration)))
+    return float(np.sign(float(last_direction)))
+
+
+def _compensation_friction_level(
+    parameters: _CompensationParameters,
+    *,
+    filtered_velocity: float,
+    config: Config,
+) -> float:
+    transition_speed = max(float(config.safety.moving_velocity_threshold), 1.0e-3)
+    blend = min(abs(float(filtered_velocity)) / transition_speed, 1.0)
+    return float(parameters.tau_static) + (float(parameters.tau_c) - float(parameters.tau_static)) * float(blend)
 
 
 def _send_command(
@@ -460,6 +512,14 @@ def _wait_for_stationary(
     deadline = time.monotonic() + timeout_s
     last_send = 0.0
     stable_started_at: float | None = None
+    total_frame_count = 0
+    target_frame_count = 0
+    saw_any_chunk = False
+    other_motor_ids: set[int] = set()
+    last_target_position: float | None = None
+    last_target_velocity: float | None = None
+    last_target_torque: float | None = None
+    last_target_state: int | None = None
 
     while time.monotonic() < deadline:
         now = time.monotonic()
@@ -483,8 +543,10 @@ def _wait_for_stationary(
             parser=parser,
             read_chunk_size=config.transport.read_chunk_size,
         )
+        saw_any_chunk = saw_any_chunk or bool(saw_chunk)
         saw_target = False
         for frame in frames:
+            total_frame_count += 1
             rerun_recorder.log_live_feedback_frame(
                 group_index=int(group_index),
                 round_index=int(round_index),
@@ -499,8 +561,14 @@ def _wait_for_stationary(
                 stage=str(stage),
             )
             if int(frame.motor_id) != int(target_motor_id):
+                other_motor_ids.add(int(frame.motor_id))
                 continue
             saw_target = True
+            target_frame_count += 1
+            last_target_position = float(frame.position)
+            last_target_velocity = float(frame.velocity)
+            last_target_torque = float(frame.torque)
+            last_target_state = int(frame.state)
             abort_event = _build_abort_event(
                 config=config,
                 stage=stage,
@@ -545,6 +613,38 @@ def _wait_for_stationary(
         if not saw_target and not saw_chunk:
             time.sleep(max(float(config.transport.read_timeout), 1.0e-3))
 
+    if target_frame_count == 0:
+        other_motor_text = ",".join(str(motor_id) for motor_id in sorted(other_motor_ids)) or "-"
+        raise _RuntimeAbortError(
+            AbortEvent(
+                reason="feedback_timeout",
+                stage=str(stage),
+                motor_id=int(target_motor_id),
+                group_index=int(group_index),
+                round_index=int(round_index),
+                phase_name=str(phase_name),
+                detail=(
+                    f"timeout_s={timeout_s:.3f}, target_feedback_count=0, total_frames={int(total_frame_count)}, "
+                    f"other_motor_ids={other_motor_text}, saw_any_chunk={str(bool(saw_any_chunk)).lower()}"
+                ),
+            )
+        )
+
+    stationary_detail_parts = [
+        f"timeout_s={timeout_s:.3f}",
+        f"target_feedback_count={int(target_frame_count)}",
+        f"velocity_threshold={float(config.safety.moving_velocity_threshold):.6f}",
+        f"hold_required_s={settle_required_s:.3f}",
+    ]
+    if last_target_velocity is not None:
+        stationary_detail_parts.append(f"last_velocity={float(last_target_velocity):+.6f}")
+    if last_target_position is not None:
+        stationary_detail_parts.append(f"last_position={float(last_target_position):+.6f}")
+    if last_target_torque is not None:
+        stationary_detail_parts.append(f"last_torque={float(last_target_torque):+.6f}")
+    if last_target_state is not None:
+        stationary_detail_parts.append(f"last_state=0x{int(last_target_state):X}")
+
     raise _RuntimeAbortError(
         AbortEvent(
             reason="stationary_timeout",
@@ -553,7 +653,7 @@ def _wait_for_stationary(
             group_index=int(group_index),
             round_index=int(round_index),
             phase_name=str(phase_name),
-            detail=f"timeout_s={timeout_s:.3f}",
+            detail=", ".join(stationary_detail_parts),
         )
     )
 
@@ -702,7 +802,9 @@ def _scan_breakaway_direction(
         round_index=round_index,
         phase_name=f"breakaway_{direction_label}_settle",
         stage="breakaway",
-        semantic_mode="mit_torque",
+        # Use active zero-velocity damping here so the motor does not keep coasting
+        # between the positive/negative breakaway scans.
+        semantic_mode="mit_velocity",
         capture_buffer=capture_buffer,
     )
 
@@ -1037,10 +1139,32 @@ def _run_compensation_phase(
     history_window = _compensation_history_window(config)
     time_history: deque[float] = deque(maxlen=history_window)
     velocity_history: deque[float] = deque(maxlen=history_window)
+    send_interval_s = max(float(config.transport.read_timeout), 5.0e-3)
+    feedback_timeout_s = max(float(config.transport.sync_timeout), send_interval_s)
+    last_send = 0.0
+    last_target_feedback_at = started_at
+    command_raw = 0.0
+    command = 0.0
+    last_direction = 0.0
+    acceleration = 0.0
 
     while True:
-        if runtime_limit is not None and (time.monotonic() - started_at) >= runtime_limit:
+        loop_now = time.monotonic()
+        if runtime_limit is not None and (loop_now - started_at) >= runtime_limit:
             break
+        if (loop_now - last_send) >= send_interval_s:
+            _send_command(
+                config=config,
+                transport=transport,
+                rerun_recorder=rerun_recorder,
+                target_motor_id=int(target_motor_id),
+                target_index=target_index,
+                semantic_mode="mit_torque",
+                command_value=float(command),
+                position_cmd=0.0,
+                velocity_cmd=0.0,
+            )
+            last_send = loop_now
 
         frames, saw_chunk = _poll_feedback_frames(
             transport=transport,
@@ -1065,6 +1189,7 @@ def _run_compensation_phase(
             if int(frame.motor_id) != int(target_motor_id):
                 continue
             saw_target = True
+            last_target_feedback_at = time.monotonic()
             abort_event = _build_abort_event(
                 config=config,
                 stage="compensation",
@@ -1092,10 +1217,13 @@ def _run_compensation_phase(
                 velocity_history=velocity_history,
                 config=config,
             )
-            command_raw = _compensation_torque(
+            command_raw, last_direction = _compensation_torque(
                 parameters,
                 filtered_velocity=float(filtered_velocity),
                 acceleration=float(acceleration),
+                feedback_torque=float(frame.torque),
+                last_direction=float(last_direction),
+                config=config,
             )
             command = _limit_torque_command(
                 transport,
@@ -1113,6 +1241,7 @@ def _run_compensation_phase(
                 position_cmd=0.0,
                 velocity_cmd=0.0,
             )
+            last_send = time.monotonic()
             _record_target_frame(
                 config=config,
                 rerun_recorder=rerun_recorder,
@@ -1129,6 +1258,24 @@ def _run_compensation_phase(
                 phase_name=phase_name,
                 stage="compensation",
             )
+        if (time.monotonic() - last_target_feedback_at) >= feedback_timeout_s:
+            abort_event = AbortEvent(
+                reason="feedback_timeout",
+                stage="compensation",
+                motor_id=int(target_motor_id),
+                group_index=int(group_index),
+                round_index=int(round_index),
+                phase_name=str(phase_name),
+                detail=f"timeout_s={feedback_timeout_s:.3f}, last_command={float(command):+.6f}",
+            )
+            _perform_hard_abort(
+                config=config,
+                transport=transport,
+                parser=parser,
+                target_motor_id=target_motor_id,
+                semantic_mode="mit_torque",
+            )
+            raise _RuntimeAbortError(abort_event)
         if not saw_target and not saw_chunk:
             time.sleep(max(float(config.transport.read_timeout), 1.0e-3))
 
@@ -1297,7 +1444,9 @@ def _precheck_transport(
             round_index=0,
             phase_name="precheck_zero",
             stage="precheck",
-            semantic_mode="mit_torque",
+            # Use active zero-velocity damping during precheck so lightly damped
+            # motors settle before the identification sequence starts.
+            semantic_mode="mit_velocity",
             capture_buffer=None,
         )
 
