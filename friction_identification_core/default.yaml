@@ -46,6 +46,19 @@ identification:
   repeat_count: 3
   savgol_window: 21
   savgol_polyorder: 3
+  min_tracking_ratio: 0.75
+  max_steady_velocity_std_ratio: 0.15
+  min_publishable_rounds: 2
+
+compensation:
+  require_published_model: true
+  torque_limit_ratio: 0.35
+  torque_slew_rate_nm_s: 4.0
+  static_assist_ratio_cap: 1.5
+  soft_abort_start_ratio: 0.60
+  soft_abort_stop_ratio: 0.85
+  max_inertia_torque_ratio: 0.25
+  direction_hold_samples: 3
 
 output:
   results_dir: "results"

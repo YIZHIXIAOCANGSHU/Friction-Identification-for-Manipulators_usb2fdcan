@@ -47,6 +47,11 @@ class RoundCapture:
     state: np.ndarray
     mos_temperature: np.ndarray
     id_match_ok: np.ndarray
+    filtered_velocity: np.ndarray
+    estimated_acceleration: np.ndarray
+    friction_term: np.ndarray
+    inertia_term: np.ndarray
+    guard_scale: np.ndarray
     metadata: dict[str, Any] = field(default_factory=dict)
 
     @property

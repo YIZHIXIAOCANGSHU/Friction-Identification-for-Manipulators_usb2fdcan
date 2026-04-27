@@ -100,6 +100,21 @@ class IdentificationConfig:
     repeat_count: int
     savgol_window: int
     savgol_polyorder: int
+    min_tracking_ratio: float
+    max_steady_velocity_std_ratio: float
+    min_publishable_rounds: int
+
+
+@dataclass(frozen=True)
+class CompensationConfig:
+    require_published_model: bool
+    torque_limit_ratio: float
+    torque_slew_rate_nm_s: float
+    static_assist_ratio_cap: float
+    soft_abort_start_ratio: float
+    soft_abort_stop_ratio: float
+    max_inertia_torque_ratio: float
+    direction_hold_samples: int
 
 
 @dataclass(frozen=True)
@@ -119,6 +134,7 @@ class Config:
     breakaway: BreakawayConfig
     mit_velocity: MitVelocityConfig
     identification: IdentificationConfig
+    compensation: CompensationConfig
     output: OutputConfig
     config_path: Path
     project_root: Path = PROJECT_ROOT
@@ -238,6 +254,22 @@ def _parse_identification(raw: dict[str, Any]) -> IdentificationConfig:
         repeat_count=max(int(raw.get("repeat_count", 3)), 1),
         savgol_window=max(int(raw.get("savgol_window", 21)), 3),
         savgol_polyorder=max(int(raw.get("savgol_polyorder", 3)), 1),
+        min_tracking_ratio=float(raw.get("min_tracking_ratio", 0.75)),
+        max_steady_velocity_std_ratio=float(raw.get("max_steady_velocity_std_ratio", 0.15)),
+        min_publishable_rounds=max(int(raw.get("min_publishable_rounds", 2)), 1),
+    )
+
+
+def _parse_compensation(raw: dict[str, Any]) -> CompensationConfig:
+    return CompensationConfig(
+        require_published_model=bool(raw.get("require_published_model", True)),
+        torque_limit_ratio=float(raw.get("torque_limit_ratio", 0.35)),
+        torque_slew_rate_nm_s=float(raw.get("torque_slew_rate_nm_s", 4.0)),
+        static_assist_ratio_cap=float(raw.get("static_assist_ratio_cap", 1.5)),
+        soft_abort_start_ratio=float(raw.get("soft_abort_start_ratio", 0.60)),
+        soft_abort_stop_ratio=float(raw.get("soft_abort_stop_ratio", 0.85)),
+        max_inertia_torque_ratio=float(raw.get("max_inertia_torque_ratio", 0.25)),
+        direction_hold_samples=max(int(raw.get("direction_hold_samples", 3)), 1),
     )
 
 
@@ -272,6 +304,7 @@ def load_config(path: str | Path) -> Config:
         breakaway=_parse_breakaway(payload.get("breakaway", {}), len(motors.ids)),
         mit_velocity=_parse_mit_velocity(payload.get("mit_velocity", {}), len(motors.ids)),
         identification=_parse_identification(payload.get("identification", {})),
+        compensation=_parse_compensation(payload.get("compensation", {})),
         output=_parse_output(payload.get("output", {}), project_root=PROJECT_ROOT),
         config_path=candidate,
     )
@@ -334,6 +367,27 @@ def load_config(path: str | Path) -> Config:
         raise ValueError("identification.repeat_count must be > 0.")
     if config.identification.savgol_window <= config.identification.savgol_polyorder:
         raise ValueError("identification.savgol_window must be larger than identification.savgol_polyorder.")
+    if not (0.0 < float(config.identification.min_tracking_ratio) <= 1.0):
+        raise ValueError("identification.min_tracking_ratio must be within (0, 1].")
+    if not np.isfinite(float(config.identification.max_steady_velocity_std_ratio)) or config.identification.max_steady_velocity_std_ratio <= 0.0:
+        raise ValueError("identification.max_steady_velocity_std_ratio must be > 0.")
+    if int(config.identification.min_publishable_rounds) <= 0:
+        raise ValueError("identification.min_publishable_rounds must be > 0.")
+
+    if not np.isfinite(float(config.compensation.torque_limit_ratio)) or not (0.0 < float(config.compensation.torque_limit_ratio) <= 1.0):
+        raise ValueError("compensation.torque_limit_ratio must be within (0, 1].")
+    if not np.isfinite(float(config.compensation.torque_slew_rate_nm_s)) or config.compensation.torque_slew_rate_nm_s <= 0.0:
+        raise ValueError("compensation.torque_slew_rate_nm_s must be > 0.")
+    if not np.isfinite(float(config.compensation.static_assist_ratio_cap)) or config.compensation.static_assist_ratio_cap <= 0.0:
+        raise ValueError("compensation.static_assist_ratio_cap must be > 0.")
+    if not np.isfinite(float(config.compensation.soft_abort_start_ratio)) or not (0.0 < float(config.compensation.soft_abort_start_ratio) < 1.0):
+        raise ValueError("compensation.soft_abort_start_ratio must be within (0, 1).")
+    if not np.isfinite(float(config.compensation.soft_abort_stop_ratio)) or not (float(config.compensation.soft_abort_start_ratio) < float(config.compensation.soft_abort_stop_ratio) <= 1.0):
+        raise ValueError("compensation.soft_abort_stop_ratio must be within (soft_abort_start_ratio, 1].")
+    if not np.isfinite(float(config.compensation.max_inertia_torque_ratio)) or not (0.0 <= float(config.compensation.max_inertia_torque_ratio) <= 1.0):
+        raise ValueError("compensation.max_inertia_torque_ratio must be within [0, 1].")
+    if int(config.compensation.direction_hold_samples) <= 0:
+        raise ValueError("compensation.direction_hold_samples must be > 0.")
 
     return config
 

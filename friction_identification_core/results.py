@@ -85,6 +85,15 @@ def _nanstd(values: list[float]) -> float:
     return float(np.nanstd(array))
 
 
+def _nanmedian(values: list[float]) -> float:
+    if not values:
+        return float("nan")
+    array = np.asarray(values, dtype=np.float64)
+    if not np.any(np.isfinite(array)):
+        return float("nan")
+    return float(np.nanmedian(array))
+
+
 def latest_parameters_path(config: Config) -> Path:
     return Path(config.results_dir) / config.output.latest_parameters_json_filename
 
@@ -144,6 +153,7 @@ class ResultStore:
             "rerun_recording_path": str(self.rerun_recording_path),
             "config_path": str(config.config_path),
         }
+        self._latest_publish_payload: dict[str, np.ndarray] | None = None
         self._write_manifest()
 
     def _write_manifest(self) -> None:
@@ -178,6 +188,11 @@ class ResultStore:
             state=np.asarray(capture.state, dtype=np.uint8),
             mos_temperature=np.asarray(capture.mos_temperature, dtype=np.float64),
             id_match_ok=np.asarray(capture.id_match_ok, dtype=bool),
+            filtered_velocity=np.asarray(capture.filtered_velocity, dtype=np.float64),
+            estimated_acceleration=np.asarray(capture.estimated_acceleration, dtype=np.float64),
+            friction_term=np.asarray(capture.friction_term, dtype=np.float64),
+            inertia_term=np.asarray(capture.inertia_term, dtype=np.float64),
+            guard_scale=np.asarray(capture.guard_scale, dtype=np.float64),
             metadata=_json_scalar(capture.metadata),
         )
         self._manifest["capture_files"].append(str(path))
@@ -228,7 +243,9 @@ class ResultStore:
         return path
 
     def save_summary(self, artifacts: list[RoundArtifact]) -> SummaryPaths:
-        payload = self._build_summary_payload(artifacts)
+        payload = self._latest_publish_payload
+        if payload is None:
+            payload = self._build_summary_payload(artifacts, existing_latest=self._load_existing_latest_parameters())
 
         run_summary_path = self.summary_dir / self._config.output.summary_filename
         run_summary_csv_path = self.summary_dir / self._config.output.summary_csv_filename
@@ -265,14 +282,15 @@ class ResultStore:
         )
 
     def save_latest_parameters(self, artifacts: list[RoundArtifact]) -> Path:
-        payload = self._build_summary_payload(artifacts)
-        rows = self._summary_rows(payload)
         existing = self._load_existing_latest_parameters()
+        payload = self._build_summary_payload(artifacts, existing_latest=existing)
+        self._latest_publish_payload = payload
+        rows = self._summary_rows(payload)
         merged_motors = dict(existing.get("motors", {}))
         updated_at = utc_now_iso8601()
 
         for row in rows:
-            if int(row["round_count"]) <= 0:
+            if int(row["round_count"]) <= 0 or str(row["publish_status"]) != "published":
                 continue
             merged_motors[str(int(row["motor_id"]))] = {
                 "motor_id": int(row["motor_id"]),
@@ -288,6 +306,11 @@ class ResultStore:
                 "inertia_validation_rmse": float(row["inertia_validation_rmse"]),
                 "repeat_consistency_score": float(row["repeat_consistency_score"]),
                 "recommended_for_compensation": bool(row["recommended_for_compensation"]),
+                "model_kind": "static_v1",
+                "publish_status": str(row["publish_status"]),
+                "publish_detail": str(row["publish_detail"]),
+                "accepted_round_count": int(row["accepted_round_count"]),
+                "selected_rounds": list(row["selected_rounds"]),
             }
 
         ordered_motors = {
@@ -314,11 +337,22 @@ class ResultStore:
             raise ValueError(f"latest motor parameters file has invalid 'motors': {self.latest_parameters_path}")
         return payload
 
-    def _build_summary_payload(self, artifacts: list[RoundArtifact]) -> dict[str, np.ndarray]:
+    def _build_summary_payload(
+        self,
+        artifacts: list[RoundArtifact],
+        *,
+        existing_latest: dict[str, Any] | None = None,
+    ) -> dict[str, np.ndarray]:
         motor_ids = list(self._config.motor_ids)
         motor_names = [self._config.motors.name_for(motor_id) for motor_id in motor_ids]
+        existing_motors = {}
+        if isinstance(existing_latest, dict):
+            raw_motors = existing_latest.get("motors", {})
+            if isinstance(raw_motors, dict):
+                existing_motors = raw_motors
         count = len(motor_ids)
         round_count = np.zeros(count, dtype=np.int64)
+        accepted_round_count = np.zeros(count, dtype=np.int64)
         tau_static = np.full(count, np.nan, dtype=np.float64)
         tau_static_std = np.full(count, np.nan, dtype=np.float64)
         tau_bias = np.full(count, np.nan, dtype=np.float64)
@@ -333,32 +367,44 @@ class ResultStore:
         inertia_validation_rmse = np.full(count, np.nan, dtype=np.float64)
         repeat_consistency_score = np.full(count, np.nan, dtype=np.float64)
         recommended_for_compensation = np.zeros(count, dtype=bool)
+        publish_status = np.asarray(["not_run"] * count, dtype="<U64")
+        publish_detail = np.asarray([""] * count, dtype="<U256")
+        selected_rounds_json = np.asarray(["[]"] * count, dtype="<U128")
         history: dict[str, list[dict[str, Any]]] = {}
 
         for index, motor_id in enumerate(motor_ids):
             motor_artifacts = [artifact for artifact in artifacts if artifact.capture.target_motor_id == motor_id]
+            accepted_artifacts = [
+                artifact
+                for artifact in motor_artifacts
+                if bool(artifact.identification.validation.recommended_for_compensation)
+            ]
             round_count[index] = len(motor_artifacts)
+            accepted_round_count[index] = len(accepted_artifacts)
             history[str(motor_id)] = []
             if not motor_artifacts:
                 continue
+            selected_artifacts = accepted_artifacts if accepted_artifacts else motor_artifacts
+            selected_rounds = [int(artifact.capture.group_index) for artifact in accepted_artifacts]
+            selected_rounds_json[index] = json.dumps(selected_rounds, ensure_ascii=False)
 
-            static_values = [float(item.identification.breakaway.tau_static) for item in motor_artifacts]
-            bias_values = [float(item.identification.breakaway.tau_bias) for item in motor_artifacts]
-            coulomb_values = [float(item.identification.friction.tau_c) for item in motor_artifacts]
-            viscous_values = [float(item.identification.friction.viscous) for item in motor_artifacts]
-            inertia_values = [float(item.identification.inertia.inertia) for item in motor_artifacts]
-            friction_rmse_values = [float(item.identification.validation.friction_rmse) for item in motor_artifacts]
-            inertia_rmse_values = [float(item.identification.validation.inertia_rmse) for item in motor_artifacts]
+            static_values = [float(item.identification.breakaway.tau_static) for item in selected_artifacts]
+            bias_values = [float(item.identification.breakaway.tau_bias) for item in selected_artifacts]
+            coulomb_values = [float(item.identification.friction.tau_c) for item in selected_artifacts]
+            viscous_values = [float(item.identification.friction.viscous) for item in selected_artifacts]
+            inertia_values = [float(item.identification.inertia.inertia) for item in selected_artifacts]
+            friction_rmse_values = [float(item.identification.validation.friction_rmse) for item in selected_artifacts]
+            inertia_rmse_values = [float(item.identification.validation.inertia_rmse) for item in selected_artifacts]
 
-            tau_static[index] = _nanmean(static_values)
+            tau_static[index] = _nanmedian(static_values)
             tau_static_std[index] = _nanstd(static_values)
-            tau_bias[index] = _nanmean(bias_values)
+            tau_bias[index] = _nanmedian(bias_values)
             tau_bias_std[index] = _nanstd(bias_values)
-            tau_c[index] = _nanmean(coulomb_values)
+            tau_c[index] = _nanmedian(coulomb_values)
             tau_c_std[index] = _nanstd(coulomb_values)
-            viscous[index] = _nanmean(viscous_values)
+            viscous[index] = _nanmedian(viscous_values)
             viscous_std[index] = _nanstd(viscous_values)
-            inertia[index] = _nanmean(inertia_values)
+            inertia[index] = _nanmedian(inertia_values)
             inertia_std[index] = _nanstd(inertia_values)
             friction_validation_rmse[index] = _nanmean(friction_rmse_values)
             inertia_validation_rmse[index] = _nanmean(inertia_rmse_values)
@@ -373,13 +419,28 @@ class ResultStore:
                 if np.isfinite(mean_value) and np.isfinite(std_value):
                     relative_terms.append(float(std_value / max(abs(float(mean_value)), 1.0e-6)))
             repeat_consistency_score[index] = max(relative_terms) if relative_terms else float("nan")
-            recommended_for_compensation[index] = bool(
-                np.all([artifact.identification.validation.recommended_for_compensation for artifact in motor_artifacts])
-                and (
-                    not np.isfinite(repeat_consistency_score[index])
-                    or float(repeat_consistency_score[index]) <= 0.20
+            min_publishable_rounds = int(self._config.identification.min_publishable_rounds)
+            has_previous_model = str(int(motor_id)) in existing_motors
+            recommended_for_compensation[index] = bool(accepted_round_count[index] >= min_publishable_rounds)
+            if int(accepted_round_count[index]) >= min_publishable_rounds:
+                publish_status[index] = "published"
+                publish_detail[index] = (
+                    f"published {int(accepted_round_count[index])}/{int(round_count[index])} accepted rounds"
                 )
-            )
+            elif has_previous_model:
+                publish_status[index] = "retained_previous_model"
+                publish_detail[index] = (
+                    f"kept previous model; accepted_round_count={int(accepted_round_count[index])}, "
+                    f"required={min_publishable_rounds}"
+                )
+            elif int(accepted_round_count[index]) > 0:
+                publish_status[index] = "not_published"
+                publish_detail[index] = (
+                    f"accepted_round_count={int(accepted_round_count[index])}, required={min_publishable_rounds}"
+                )
+            else:
+                publish_status[index] = "rejected"
+                publish_detail[index] = "no accepted rounds in current run"
 
             for artifact in motor_artifacts:
                 history[str(motor_id)].append(
@@ -398,6 +459,9 @@ class ResultStore:
                         "recommended_for_compensation": bool(
                             artifact.identification.validation.recommended_for_compensation
                         ),
+                        "validation_status": str(artifact.identification.validation.metadata.get("status", "unknown")),
+                        "validation_detail": str(artifact.identification.validation.detail),
+                        "selected_for_publish": bool(artifact.identification.validation.recommended_for_compensation),
                     }
                 )
 
@@ -405,6 +469,7 @@ class ResultStore:
             "motor_ids": np.asarray(motor_ids, dtype=np.int64),
             "motor_names": np.asarray(motor_names),
             "round_count": round_count,
+            "accepted_round_count": accepted_round_count,
             "tau_static": tau_static,
             "tau_static_std": tau_static_std,
             "tau_bias": tau_bias,
@@ -419,6 +484,9 @@ class ResultStore:
             "inertia_validation_rmse": inertia_validation_rmse,
             "repeat_consistency_score": repeat_consistency_score,
             "recommended_for_compensation": recommended_for_compensation,
+            "publish_status": np.asarray(publish_status),
+            "publish_detail": np.asarray(publish_detail),
+            "selected_rounds_json": np.asarray(selected_rounds_json),
             "history_json": np.asarray(json.dumps(history, ensure_ascii=False)),
         }
 
@@ -426,12 +494,17 @@ class ResultStore:
         rows: list[dict[str, object]] = []
         motor_ids = np.asarray(payload["motor_ids"], dtype=np.int64)
         motor_names = np.asarray(payload["motor_names"]).astype(str)
+        publish_status = np.asarray(payload["publish_status"]).astype(str)
+        publish_detail = np.asarray(payload["publish_detail"]).astype(str)
+        selected_rounds_json = np.asarray(payload["selected_rounds_json"]).astype(str)
         for index, motor_id in enumerate(motor_ids.tolist()):
+            selected_rounds = json.loads(selected_rounds_json[index]) if selected_rounds_json[index] else []
             rows.append(
                 {
                     "motor_id": int(motor_id),
                     "motor_name": str(motor_names[index]),
                     "round_count": int(payload["round_count"][index]),
+                    "accepted_round_count": int(payload["accepted_round_count"][index]),
                     "tau_static": float(payload["tau_static"][index]),
                     "tau_static_std": float(payload["tau_static_std"][index]),
                     "tau_bias": float(payload["tau_bias"][index]),
@@ -446,6 +519,9 @@ class ResultStore:
                     "inertia_validation_rmse": float(payload["inertia_validation_rmse"][index]),
                     "repeat_consistency_score": float(payload["repeat_consistency_score"][index]),
                     "recommended_for_compensation": bool(payload["recommended_for_compensation"][index]),
+                    "publish_status": str(publish_status[index]),
+                    "publish_detail": str(publish_detail[index]),
+                    "selected_rounds": list(selected_rounds),
                 }
             )
         return rows
@@ -456,6 +532,7 @@ class ResultStore:
             "motor_id",
             "motor_name",
             "round_count",
+            "accepted_round_count",
             "tau_static",
             "tau_static_std",
             "tau_bias",
@@ -470,6 +547,9 @@ class ResultStore:
             "inertia_validation_rmse",
             "repeat_consistency_score",
             "recommended_for_compensation",
+            "publish_status",
+            "publish_detail",
+            "selected_rounds",
         ]
         with open(path, "w", encoding="utf-8", newline="") as handle:
             writer = csv.DictWriter(handle, fieldnames=fieldnames)
@@ -478,10 +558,12 @@ class ResultStore:
 
     def _write_summary_report(self, path: Path, payload: dict[str, np.ndarray]) -> None:
         rows = self._summary_rows(payload)
+        history_text = str(np.asarray(payload["history_json"]).item())
+        history = json.loads(history_text) if history_text else {}
         lines = [
             "# Hardware Identification Summary",
             "",
-            "| Motor | tau_static | tau_c | viscous | inertia | friction RMSE | inertia RMSE | repeat consistency | recommended |",
+            "| Motor | accepted/total | tau_static | tau_c | viscous | inertia | friction RMSE | inertia RMSE | publish status |",
             "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |",
         ]
         for row in rows:
@@ -490,18 +572,47 @@ class ResultStore:
                 + " | ".join(
                     [
                         f"{int(row['motor_id']):02d} {row['motor_name']}",
+                        f"{int(row['accepted_round_count'])}/{int(row['round_count'])}",
                         f"{float(row['tau_static']):.6f}",
                         f"{float(row['tau_c']):.6f}",
                         f"{float(row['viscous']):.6f}",
                         f"{float(row['inertia']):.6f}",
                         f"{float(row['friction_validation_rmse']):.6f}",
                         f"{float(row['inertia_validation_rmse']):.6f}",
-                        f"{float(row['repeat_consistency_score']):.6f}",
-                        "yes" if bool(row["recommended_for_compensation"]) else "no",
+                        str(row["publish_status"]),
                     ]
                 )
                 + " |"
             )
+        for row in rows:
+            motor_history = history.get(str(int(row["motor_id"])), [])
+            selected_rounds = ",".join(str(item) for item in row["selected_rounds"]) or "-"
+            lines.extend(
+                [
+                    "",
+                    f"## Motor {int(row['motor_id']):02d} {row['motor_name']}",
+                    "",
+                    f"- publish_status: `{row['publish_status']}`",
+                    f"- publish_detail: `{row['publish_detail']}`",
+                    f"- selected_rounds: `{selected_rounds}`",
+                    f"- repeat_consistency_score: `{float(row['repeat_consistency_score']):.6f}`",
+                ]
+            )
+            for item in motor_history:
+                lines.append(
+                    "- "
+                    + ", ".join(
+                        [
+                            f"group={int(item['group_index'])}",
+                            f"round={int(item['round_index'])}",
+                            f"selected_for_publish={'yes' if bool(item['selected_for_publish']) else 'no'}",
+                            f"validation_status={item['validation_status']}",
+                            f"friction_rmse={float(item['friction_rmse']):.6f}",
+                            f"inertia_rmse={float(item['inertia_rmse']):.6f}",
+                            f"detail={item['validation_detail']}",
+                        ]
+                    )
+                )
         path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 

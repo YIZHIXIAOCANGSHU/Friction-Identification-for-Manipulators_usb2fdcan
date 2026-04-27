@@ -26,6 +26,10 @@
 - `safety.hard_speed_abort_abs` 默认 `10.0`
 - `breakaway.torque_step` 默认 `0.01`
 - `mit_velocity.kd_speed` 支持逐电机配置
+- `identification.min_tracking_ratio` / `identification.max_steady_velocity_std_ratio` 用于筛掉跟踪差、平台不稳的速度保持段。
+- `identification.min_publishable_rounds` 默认 `2`，最新模型只会由“合格轮次”发布；不合格轮次不会覆盖旧的已发布模型。
+- `compensation.require_published_model` 默认 `true`，补偿模式默认只允许加载已发布模型。
+- `compensation.torque_limit_ratio` / `torque_slew_rate_nm_s` / `soft_abort_*` 用于限制补偿扭矩、抑制突变和提前触发速度保护。
 - `output.latest_parameters_json_filename` 默认 `latest_motor_parameters.json`
 
 常用命令：
@@ -49,6 +53,8 @@ python3 -m friction_identification_core --config friction_identification_core/de
   - `results/runs/<timestamp>_<mode>/summary/hardware_identification_summary.csv`
   - `results/runs/<timestamp>_<mode>/summary/hardware_identification_summary.md`
 - 最新模型登记会保存到 `results/latest_motor_parameters.json`
+  - 已发布模型会带 `model_kind`、`publish_status`、`publish_detail`、`accepted_round_count`、`selected_rounds`
+  - 若本轮辨识未达到发布条件，会保留旧模型，不会用差模型覆盖
 
 SocketCAN / 达妙协议：
 

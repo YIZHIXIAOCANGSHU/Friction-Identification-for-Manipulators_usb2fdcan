@@ -18,7 +18,6 @@ from friction_identification_core.core import (
     ValidationResult,
 )
 from friction_identification_core.identification import (
-    build_validation_result,
     estimate_filtered_velocity_and_acceleration,
     fit_friction_model,
     fit_inertia_model,
@@ -68,6 +67,11 @@ class _CaptureBuffer:
     state_log: list[int] = field(default_factory=list)
     mos_temperature_log: list[float] = field(default_factory=list)
     id_match_log: list[bool] = field(default_factory=list)
+    filtered_velocity_log: list[float] = field(default_factory=list)
+    estimated_acceleration_log: list[float] = field(default_factory=list)
+    friction_term_log: list[float] = field(default_factory=list)
+    inertia_term_log: list[float] = field(default_factory=list)
+    guard_scale_log: list[float] = field(default_factory=list)
 
     def append(
         self,
@@ -79,6 +83,11 @@ class _CaptureBuffer:
         velocity_cmd: float,
         acceleration_cmd: float,
         phase_name: str,
+        filtered_velocity: float = float("nan"),
+        estimated_acceleration: float = float("nan"),
+        friction_term: float = float("nan"),
+        inertia_term: float = float("nan"),
+        guard_scale: float = float("nan"),
     ) -> None:
         self.time_log.append(time.monotonic() - self.start_monotonic)
         self.motor_id_log.append(int(frame.motor_id))
@@ -94,6 +103,11 @@ class _CaptureBuffer:
         self.state_log.append(int(frame.state))
         self.mos_temperature_log.append(float(frame.mos_temperature))
         self.id_match_log.append(True)
+        self.filtered_velocity_log.append(float(filtered_velocity))
+        self.estimated_acceleration_log.append(float(estimated_acceleration))
+        self.friction_term_log.append(float(friction_term))
+        self.inertia_term_log.append(float(inertia_term))
+        self.guard_scale_log.append(float(guard_scale))
 
     def build(self, *, group_index: int, round_index: int, metadata: dict[str, object]) -> RoundCapture:
         return RoundCapture(
@@ -115,6 +129,11 @@ class _CaptureBuffer:
             state=np.asarray(self.state_log, dtype=np.uint8),
             mos_temperature=np.asarray(self.mos_temperature_log, dtype=np.float64),
             id_match_ok=np.asarray(self.id_match_log, dtype=bool),
+            filtered_velocity=np.asarray(self.filtered_velocity_log, dtype=np.float64),
+            estimated_acceleration=np.asarray(self.estimated_acceleration_log, dtype=np.float64),
+            friction_term=np.asarray(self.friction_term_log, dtype=np.float64),
+            inertia_term=np.asarray(self.inertia_term_log, dtype=np.float64),
+            guard_scale=np.asarray(self.guard_scale_log, dtype=np.float64),
             metadata=dict(metadata),
         )
 
@@ -125,6 +144,11 @@ class _CompensationParameters:
     motor_name: str
     identified_at: str
     source_run_label: str
+    model_kind: str
+    publish_status: str
+    publish_detail: str
+    accepted_round_count: int
+    selected_rounds: tuple[int, ...]
     tau_static: float
     tau_bias: float
     tau_c: float
@@ -134,6 +158,15 @@ class _CompensationParameters:
     inertia_validation_rmse: float
     repeat_consistency_score: float
     recommended_for_compensation: bool
+
+
+@dataclass(frozen=True)
+class _CompensationCommand:
+    raw_torque: float
+    direction: float
+    friction_term: float
+    inertia_term: float
+    guard_scale: float
 
 
 def _sent_command_vector(config: Config, *, target_index: int, target_command: float) -> np.ndarray:
@@ -226,11 +259,35 @@ def _load_compensation_parameters(config: Config, *, target_motor_id: int) -> _C
             f"motor_id={int(target_motor_id)}: {', '.join(missing_fields)}"
         )
 
+    model_kind = str(entry.get("model_kind", "static_v1"))
+    publish_status = str(
+        entry.get(
+            "publish_status",
+            "published" if bool(entry.get("recommended_for_compensation", False)) else "not_published",
+        )
+    )
+    publish_detail = str(entry.get("publish_detail", "legacy entry"))
+    selected_rounds_raw = entry.get("selected_rounds", ())
+    if not isinstance(selected_rounds_raw, (list, tuple)):
+        selected_rounds_raw = ()
+    selected_rounds = tuple(int(item) for item in selected_rounds_raw)
+    accepted_round_count = int(entry.get("accepted_round_count", len(selected_rounds) if selected_rounds else 0))
+    if bool(config.compensation.require_published_model) and publish_status != "published":
+        raise ValueError(
+            f"compensation requires a published model for motor_id={int(target_motor_id)}: "
+            f"publish_status={publish_status}, latest_parameters_path={latest_path}"
+        )
+
     return _CompensationParameters(
         motor_id=int(entry["motor_id"]),
         motor_name=str(entry["motor_name"]),
         identified_at=str(entry["identified_at"]),
         source_run_label=str(entry["source_run_label"]),
+        model_kind=model_kind,
+        publish_status=publish_status,
+        publish_detail=publish_detail,
+        accepted_round_count=accepted_round_count,
+        selected_rounds=selected_rounds,
         tau_static=float(entry["tau_static"]),
         tau_bias=float(entry["tau_bias"]),
         tau_c=float(entry["tau_c"]),
@@ -280,39 +337,89 @@ def _compute_compensation_state(
     return float(filtered_velocity[-1]), float(acceleration[-1])
 
 
+def _compensation_torque_limit_abs(
+    transport: CommandTransport,
+    *,
+    target_motor_id: int,
+    config: Config,
+) -> float:
+    motor_limits = getattr(transport, "motor_limits", None)
+    if callable(motor_limits):
+        limits = motor_limits(int(target_motor_id))
+        torque_limit = getattr(limits, "tmax", None) if limits is not None else None
+        if torque_limit is not None and np.isfinite(float(torque_limit)) and float(torque_limit) > 0.0:
+            return float(config.compensation.torque_limit_ratio) * abs(float(torque_limit))
+
+    probe_limit = abs(
+        _limit_torque_command(
+            transport,
+            target_motor_id=int(target_motor_id),
+            torque=1.0e9,
+        )
+    )
+    if np.isfinite(probe_limit) and probe_limit > 0.0:
+        return float(config.compensation.torque_limit_ratio) * float(probe_limit)
+    return float("inf")
+
+
+def _compensation_soft_guard_scale(filtered_velocity: float, config: Config) -> float:
+    hard_speed_limit = float(config.safety.hard_speed_abort_abs)
+    start_speed = float(config.compensation.soft_abort_start_ratio) * hard_speed_limit
+    stop_speed = float(config.compensation.soft_abort_stop_ratio) * hard_speed_limit
+    abs_velocity = abs(float(filtered_velocity))
+    if abs_velocity <= start_speed:
+        return 1.0
+    if abs_velocity >= stop_speed:
+        return 0.0
+    return float((stop_speed - abs_velocity) / max(stop_speed - start_speed, 1.0e-9))
+
+
 def _compensation_torque(
     parameters: _CompensationParameters,
     *,
     filtered_velocity: float,
     acceleration: float,
-    feedback_torque: float,
-    last_direction: float,
+    direction: float,
+    static_assist_enabled: bool,
+    torque_limit_abs: float,
     config: Config,
-) -> tuple[float, float]:
-    feedback_torque_epsilon = max(
-        0.1 * max(abs(float(parameters.tau_static)), abs(float(parameters.tau_c))),
-        1.0e-3,
-    )
-    direction = _compensation_direction(
-        filtered_velocity=float(filtered_velocity),
-        acceleration=float(acceleration),
-        feedback_torque=float(feedback_torque),
-        feedback_torque_epsilon=float(feedback_torque_epsilon),
-        last_direction=float(last_direction),
-        config=config,
-    )
+) -> _CompensationCommand:
     friction_level = _compensation_friction_level(
         parameters,
         filtered_velocity=float(filtered_velocity),
+        static_assist_enabled=bool(static_assist_enabled),
         config=config,
     )
-    torque = (
+    friction_term = (
         float(direction) * float(friction_level)
         + float(parameters.viscous) * float(filtered_velocity)
         + float(parameters.tau_bias)
-        + float(parameters.inertia) * float(acceleration)
     )
-    return float(torque), float(direction)
+    inertia_limit_abs = (
+        float(config.compensation.max_inertia_torque_ratio) * float(torque_limit_abs)
+        if np.isfinite(float(torque_limit_abs))
+        else float("inf")
+    )
+    raw_inertia_term = float(parameters.inertia) * float(acceleration)
+    inertia_term = (
+        float(np.clip(raw_inertia_term, -inertia_limit_abs, inertia_limit_abs))
+        if np.isfinite(float(inertia_limit_abs))
+        else float(raw_inertia_term)
+    )
+    soft_guard_scale = _compensation_soft_guard_scale(float(filtered_velocity), config)
+    torque_before_limit = (float(friction_term) + float(inertia_term)) * float(soft_guard_scale)
+    hard_guard_scale = 1.0
+    limited_torque = float(torque_before_limit)
+    if np.isfinite(float(torque_limit_abs)) and float(torque_limit_abs) > 0.0:
+        hard_guard_scale = min(1.0, float(torque_limit_abs) / max(abs(float(torque_before_limit)), 1.0e-9))
+        limited_torque = float(np.clip(torque_before_limit, -float(torque_limit_abs), float(torque_limit_abs)))
+    return _CompensationCommand(
+        raw_torque=float(limited_torque),
+        direction=float(direction),
+        friction_term=float(friction_term),
+        inertia_term=float(inertia_term),
+        guard_scale=float(soft_guard_scale * hard_guard_scale),
+    )
 
 
 def _compensation_direction(
@@ -339,11 +446,24 @@ def _compensation_friction_level(
     parameters: _CompensationParameters,
     *,
     filtered_velocity: float,
+    static_assist_enabled: bool,
     config: Config,
 ) -> float:
     transition_speed = max(float(config.safety.moving_velocity_threshold), 1.0e-3)
     blend = min(abs(float(filtered_velocity)) / transition_speed, 1.0)
-    return float(parameters.tau_static) + (float(parameters.tau_c) - float(parameters.tau_static)) * float(blend)
+    effective_tau_static = min(
+        float(parameters.tau_static),
+        float(config.compensation.static_assist_ratio_cap) * max(abs(float(parameters.tau_c)), 0.0),
+    )
+    low_speed_level = effective_tau_static if bool(static_assist_enabled) else float(parameters.tau_c)
+    return float(low_speed_level) + (float(parameters.tau_c) - float(low_speed_level)) * float(blend)
+
+
+def _limit_compensation_slew(*, previous_command: float, desired_command: float, dt_s: float, config: Config) -> float:
+    if dt_s <= 0.0:
+        return float(desired_command)
+    max_delta = float(config.compensation.torque_slew_rate_nm_s) * float(dt_s)
+    return float(np.clip(float(desired_command), float(previous_command) - max_delta, float(previous_command) + max_delta))
 
 
 def _send_command(
@@ -400,6 +520,11 @@ def _record_target_frame(
     acceleration_cmd: float,
     phase_name: str,
     stage: str,
+    filtered_velocity: float = float("nan"),
+    estimated_acceleration: float = float("nan"),
+    friction_term: float = float("nan"),
+    inertia_term: float = float("nan"),
+    guard_scale: float = float("nan"),
 ) -> None:
     if capture_buffer is not None:
         capture_buffer.append(
@@ -410,6 +535,11 @@ def _record_target_frame(
             velocity_cmd=float(velocity_cmd),
             acceleration_cmd=float(acceleration_cmd),
             phase_name=str(phase_name),
+            filtered_velocity=float(filtered_velocity),
+            estimated_acceleration=float(estimated_acceleration),
+            friction_term=float(friction_term),
+            inertia_term=float(inertia_term),
+            guard_scale=float(guard_scale),
         )
 
     target_index = config.motor_index(target_motor_id)
@@ -457,6 +587,35 @@ def _build_abort_event(
         observed_velocity=float(frame.velocity),
         velocity_limit=float(config.safety.hard_speed_abort_abs),
         detail=f"abs_velocity={abs(float(frame.velocity)):.6f}",
+    )
+
+
+def _build_soft_abort_event(
+    *,
+    config: Config,
+    stage: str,
+    group_index: int,
+    round_index: int,
+    phase_name: str,
+    target_motor_id: int,
+    frame,
+) -> AbortEvent | None:
+    soft_velocity_limit = float(config.compensation.soft_abort_stop_ratio) * float(config.safety.hard_speed_abort_abs)
+    if abs(float(frame.velocity)) < soft_velocity_limit:
+        return None
+    return AbortEvent(
+        reason="soft_speed_abort",
+        stage=str(stage),
+        motor_id=int(target_motor_id),
+        group_index=int(group_index),
+        round_index=int(round_index),
+        phase_name=str(phase_name),
+        observed_velocity=float(frame.velocity),
+        velocity_limit=float(soft_velocity_limit),
+        detail=(
+            f"abs_velocity={abs(float(frame.velocity)):.6f}, "
+            f"hard_speed_limit={float(config.safety.hard_speed_abort_abs):.6f}"
+        ),
     )
 
 
@@ -1143,10 +1302,18 @@ def _run_compensation_phase(
     feedback_timeout_s = max(float(config.transport.sync_timeout), send_interval_s)
     last_send = 0.0
     last_target_feedback_at = started_at
+    torque_limit_abs = _compensation_torque_limit_abs(
+        transport,
+        target_motor_id=int(target_motor_id),
+        config=config,
+    )
     command_raw = 0.0
     command = 0.0
     last_direction = 0.0
+    pending_direction = 0.0
+    direction_hold_count = 0
     acceleration = 0.0
+    last_command_sample_time: float | None = None
 
     while True:
         loop_now = time.monotonic()
@@ -1208,6 +1375,24 @@ def _run_compensation_phase(
                     semantic_mode="mit_torque",
                 )
                 raise _RuntimeAbortError(abort_event)
+            soft_abort_event = _build_soft_abort_event(
+                config=config,
+                stage="compensation",
+                group_index=group_index,
+                round_index=round_index,
+                phase_name=phase_name,
+                target_motor_id=target_motor_id,
+                frame=frame,
+            )
+            if soft_abort_event is not None:
+                _perform_hard_abort(
+                    config=config,
+                    transport=transport,
+                    parser=parser,
+                    target_motor_id=target_motor_id,
+                    semantic_mode="mit_torque",
+                )
+                raise _RuntimeAbortError(soft_abort_event)
 
             sample_time = float(time.monotonic() - capture_buffer.start_monotonic)
             time_history.append(sample_time)
@@ -1217,18 +1402,52 @@ def _run_compensation_phase(
                 velocity_history=velocity_history,
                 config=config,
             )
-            command_raw, last_direction = _compensation_torque(
-                parameters,
+            feedback_torque_epsilon = max(
+                0.1 * max(abs(float(parameters.tau_static)), abs(float(parameters.tau_c))),
+                1.0e-3,
+            )
+            current_direction = _compensation_direction(
                 filtered_velocity=float(filtered_velocity),
                 acceleration=float(acceleration),
                 feedback_torque=float(frame.torque),
+                feedback_torque_epsilon=float(feedback_torque_epsilon),
                 last_direction=float(last_direction),
                 config=config,
             )
+            if abs(float(current_direction)) > 0.0:
+                if np.sign(float(current_direction)) == np.sign(float(pending_direction)):
+                    direction_hold_count += 1
+                else:
+                    pending_direction = float(current_direction)
+                    direction_hold_count = 1
+                last_direction = float(current_direction)
+            static_assist_enabled = bool(
+                abs(float(filtered_velocity)) < max(float(config.safety.moving_velocity_threshold), 1.0e-3)
+                and direction_hold_count >= int(config.compensation.direction_hold_samples)
+                and abs(float(current_direction)) > 0.0
+            )
+            compensation_command = _compensation_torque(
+                parameters,
+                filtered_velocity=float(filtered_velocity),
+                acceleration=float(acceleration),
+                direction=float(current_direction),
+                static_assist_enabled=static_assist_enabled,
+                torque_limit_abs=float(torque_limit_abs),
+                config=config,
+            )
+            command_raw = float(compensation_command.raw_torque)
+            dt_s = 0.0 if last_command_sample_time is None else max(float(sample_time) - float(last_command_sample_time), 0.0)
+            command = _limit_compensation_slew(
+                previous_command=float(command),
+                desired_command=float(command_raw),
+                dt_s=float(dt_s),
+                config=config,
+            )
+            last_command_sample_time = float(sample_time)
             command = _limit_torque_command(
                 transport,
                 target_motor_id=target_motor_id,
-                torque=float(command_raw),
+                torque=float(command),
             )
             _send_command(
                 config=config,
@@ -1257,6 +1476,11 @@ def _run_compensation_phase(
                 acceleration_cmd=float(acceleration),
                 phase_name=phase_name,
                 stage="compensation",
+                filtered_velocity=float(filtered_velocity),
+                estimated_acceleration=float(acceleration),
+                friction_term=float(compensation_command.friction_term),
+                inertia_term=float(compensation_command.inertia_term),
+                guard_scale=float(compensation_command.guard_scale),
             )
         if (time.monotonic() - last_target_feedback_at) >= feedback_timeout_s:
             abort_event = AbortEvent(
@@ -1278,6 +1502,204 @@ def _run_compensation_phase(
             raise _RuntimeAbortError(abort_event)
         if not saw_target and not saw_chunk:
             time.sleep(max(float(config.transport.read_timeout), 1.0e-3))
+
+
+@dataclass(frozen=True)
+class _SpeedHoldPlatformStat:
+    phase_name: str
+    bucket: str
+    commanded_velocity: float
+    mean_velocity: float
+    velocity_std: float
+    mean_torque: float
+    sample_count: int
+    tracking_ratio: float
+    velocity_std_ratio: float
+    accepted: bool
+    rejection_reason: str
+
+
+def _parse_speed_hold_command_velocity(phase_name: str) -> float:
+    try:
+        return float(str(phase_name).rsplit("_", 1)[-1])
+    except ValueError:
+        return float("nan")
+
+
+def _collect_speed_hold_platform_stats(capture: RoundCapture, config: Config) -> list[_SpeedHoldPlatformStat]:
+    phase_names = np.asarray(capture.phase_name).astype(str)
+    ordered_phase_names = list(dict.fromkeys(phase_names.tolist()))
+    ratio = float(config.mit_velocity.steady_window_ratio)
+    platforms: list[_SpeedHoldPlatformStat] = []
+    for phase_name in ordered_phase_names:
+        if not str(phase_name).startswith("speed_hold_"):
+            continue
+        if str(phase_name).startswith("speed_hold_train_"):
+            bucket = "train"
+        elif str(phase_name).startswith("speed_hold_valid_"):
+            bucket = "valid"
+        else:
+            continue
+
+        indices = np.flatnonzero(phase_names == phase_name)
+        if indices.size == 0:
+            continue
+        start_index = int(np.floor((1.0 - ratio) * indices.size))
+        selected = indices[start_index:]
+        commanded_velocity = _parse_speed_hold_command_velocity(phase_name)
+        mean_velocity = float(np.nanmean(capture.velocity[selected])) if selected.size else float("nan")
+        velocity_std = float(np.nanstd(capture.velocity[selected])) if selected.size else float("nan")
+        mean_torque = float(np.nanmean(capture.torque_feedback[selected])) if selected.size else float("nan")
+        tracking_ratio = (
+            abs(mean_velocity) / max(abs(commanded_velocity), 1.0e-6)
+            if np.isfinite(commanded_velocity)
+            else float("nan")
+        )
+        velocity_std_ratio = (
+            velocity_std / max(abs(commanded_velocity), 1.0e-6)
+            if np.isfinite(commanded_velocity)
+            else float("nan")
+        )
+        direction_ok = bool(
+            np.isfinite(commanded_velocity)
+            and np.isfinite(mean_velocity)
+            and abs(mean_velocity) > 1.0e-6
+            and np.sign(mean_velocity) == np.sign(commanded_velocity)
+        )
+        accepted = True
+        rejection_reason = ""
+        if selected.size == 0:
+            accepted = False
+            rejection_reason = "empty_platform"
+        elif not np.isfinite(commanded_velocity):
+            accepted = False
+            rejection_reason = "invalid_command_velocity"
+        elif not np.isfinite(mean_velocity) or not np.isfinite(mean_torque):
+            accepted = False
+            rejection_reason = "non_finite_platform_statistics"
+        elif not direction_ok:
+            accepted = False
+            rejection_reason = "direction_mismatch"
+        elif tracking_ratio < float(config.identification.min_tracking_ratio):
+            accepted = False
+            rejection_reason = (
+                f"tracking_ratio_below_min:{tracking_ratio:.3f}"
+                f"<{float(config.identification.min_tracking_ratio):.3f}"
+            )
+        elif velocity_std_ratio > float(config.identification.max_steady_velocity_std_ratio):
+            accepted = False
+            rejection_reason = (
+                f"velocity_std_ratio_above_max:{velocity_std_ratio:.3f}"
+                f">{float(config.identification.max_steady_velocity_std_ratio):.3f}"
+            )
+
+        platforms.append(
+            _SpeedHoldPlatformStat(
+                phase_name=str(phase_name),
+                bucket=str(bucket),
+                commanded_velocity=float(commanded_velocity),
+                mean_velocity=float(mean_velocity),
+                velocity_std=float(velocity_std),
+                mean_torque=float(mean_torque),
+                sample_count=int(selected.size),
+                tracking_ratio=float(tracking_ratio),
+                velocity_std_ratio=float(velocity_std_ratio),
+                accepted=bool(accepted),
+                rejection_reason=str(rejection_reason),
+            )
+        )
+    return platforms
+
+
+def _annotate_friction_result(
+    result: FrictionIdentificationResult,
+    *,
+    platforms: list[_SpeedHoldPlatformStat],
+) -> FrictionIdentificationResult:
+    metadata = dict(result.metadata)
+    metadata["platforms"] = [
+        {
+            "phase_name": platform.phase_name,
+            "bucket": platform.bucket,
+            "commanded_velocity": float(platform.commanded_velocity),
+            "mean_velocity": float(platform.mean_velocity),
+            "velocity_std": float(platform.velocity_std),
+            "mean_torque": float(platform.mean_torque),
+            "sample_count": int(platform.sample_count),
+            "tracking_ratio": float(platform.tracking_ratio),
+            "velocity_std_ratio": float(platform.velocity_std_ratio),
+            "accepted": bool(platform.accepted),
+            "rejection_reason": str(platform.rejection_reason),
+        }
+        for platform in platforms
+    ]
+    metadata["accepted_train_platform_count"] = int(
+        sum(1 for platform in platforms if platform.accepted and platform.bucket == "train")
+    )
+    metadata["accepted_valid_platform_count"] = int(
+        sum(1 for platform in platforms if platform.accepted and platform.bucket == "valid")
+    )
+    metadata["rejected_platform_count"] = int(sum(1 for platform in platforms if not platform.accepted))
+    return FrictionIdentificationResult(
+        tau_c=float(result.tau_c),
+        viscous=float(result.viscous),
+        tau_bias=float(result.tau_bias),
+        train_rmse=float(result.train_rmse),
+        valid_rmse=float(result.valid_rmse),
+        train_mask=np.asarray(result.train_mask, dtype=bool),
+        valid_mask=np.asarray(result.valid_mask, dtype=bool),
+        torque_pred=np.asarray(result.torque_pred, dtype=np.float64),
+        torque_target=np.asarray(result.torque_target, dtype=np.float64),
+        metadata=metadata,
+    )
+
+
+def _build_round_validation_result(
+    friction_result: FrictionIdentificationResult,
+    inertia_result: InertiaIdentificationResult,
+) -> ValidationResult:
+    accepted_train_platform_count = int(friction_result.metadata.get("accepted_train_platform_count", 0))
+    accepted_valid_platform_count = int(friction_result.metadata.get("accepted_valid_platform_count", 0))
+    rejected_platform_count = int(friction_result.metadata.get("rejected_platform_count", 0))
+    friction_rmse = float(friction_result.valid_rmse)
+    inertia_rmse = float(inertia_result.valid_rmse)
+    reasons: list[str] = []
+
+    if accepted_train_platform_count < 2:
+        reasons.append(f"accepted_train_platform_count={accepted_train_platform_count}<2")
+    if accepted_valid_platform_count < 2:
+        reasons.append(f"accepted_valid_platform_count={accepted_valid_platform_count}<2")
+    if not np.isfinite(float(friction_result.tau_c)) or float(friction_result.tau_c) < 0.0:
+        reasons.append(f"invalid_tau_c={float(friction_result.tau_c):+.6f}")
+    if not np.isfinite(float(friction_result.viscous)) or float(friction_result.viscous) < 0.0:
+        reasons.append(f"invalid_viscous={float(friction_result.viscous):+.6f}")
+    if not np.isfinite(float(inertia_result.inertia)) or float(inertia_result.inertia) < 0.0:
+        reasons.append(f"invalid_inertia={float(inertia_result.inertia):+.6f}")
+    if not np.isfinite(friction_rmse) or friction_rmse > 0.15:
+        reasons.append(f"friction_rmse={friction_rmse:.6f}>0.150000")
+    if not np.isfinite(inertia_rmse) or inertia_rmse > 0.20:
+        reasons.append(f"inertia_rmse={inertia_rmse:.6f}>0.200000")
+
+    recommended = not reasons
+    status = "accepted" if recommended else "rejected"
+    detail = (
+        f"friction_rmse={friction_rmse:.6f}, inertia_rmse={inertia_rmse:.6f}"
+        if recommended
+        else "; ".join(reasons)
+    )
+    return ValidationResult(
+        friction_rmse=friction_rmse,
+        inertia_rmse=inertia_rmse,
+        recommended_for_compensation=bool(recommended),
+        detail=detail,
+        metadata={
+            "status": status,
+            "accepted_train_platform_count": accepted_train_platform_count,
+            "accepted_valid_platform_count": accepted_valid_platform_count,
+            "rejected_platform_count": rejected_platform_count,
+            "reasons": list(reasons),
+        },
+    )
 
 
 def _late_portion_mask(phase_names: np.ndarray, *, prefix: str, ratio: float) -> np.ndarray:
@@ -1347,24 +1769,26 @@ def _identify_round(
     friction_result = _empty_friction_result(sample_count, status="not_run")
     inertia_result = _empty_inertia_result(sample_count, status="not_run")
     validation_result = _empty_validation_result(status="not_run")
+    speed_hold_platforms = _collect_speed_hold_platform_stats(capture, config)
 
     if mode in {"identify-all", "speed-hold", "inertia"}:
-        friction_train_mask = _late_portion_mask(
-            phase_names,
-            prefix="speed_hold_train_",
-            ratio=float(config.mit_velocity.steady_window_ratio),
+        platform_velocity = np.asarray([platform.mean_velocity for platform in speed_hold_platforms], dtype=np.float64)
+        platform_torque = np.asarray([platform.mean_torque for platform in speed_hold_platforms], dtype=np.float64)
+        friction_train_mask = np.asarray(
+            [platform.accepted and platform.bucket == "train" for platform in speed_hold_platforms],
+            dtype=bool,
         )
-        friction_valid_mask = _late_portion_mask(
-            phase_names,
-            prefix="speed_hold_valid_",
-            ratio=float(config.mit_velocity.steady_window_ratio),
+        friction_valid_mask = np.asarray(
+            [platform.accepted and platform.bucket == "valid" for platform in speed_hold_platforms],
+            dtype=bool,
         )
         friction_result = fit_friction_model(
-            capture.velocity,
-            capture.torque_feedback,
+            platform_velocity,
+            platform_torque,
             train_mask=friction_train_mask,
             valid_mask=friction_valid_mask,
         )
+        friction_result = _annotate_friction_result(friction_result, platforms=speed_hold_platforms)
 
     if mode in {"identify-all", "inertia"}:
         inertia_train_mask = np.asarray([name.startswith("inertia_train_") for name in phase_names], dtype=bool)
@@ -1379,14 +1803,19 @@ def _identify_round(
             savgol_window=int(config.identification.savgol_window),
             savgol_polyorder=int(config.identification.savgol_polyorder),
         )
-        validation_result = build_validation_result(friction_result, inertia_result)
+        validation_result = _build_round_validation_result(friction_result, inertia_result)
     elif mode == "speed-hold":
         validation_result = ValidationResult(
             friction_rmse=float(friction_result.valid_rmse),
             inertia_rmse=float("nan"),
             recommended_for_compensation=False,
             detail="speed-hold debug mode",
-            metadata={"status": "partial"},
+            metadata={
+                "status": "partial",
+                "accepted_train_platform_count": int(friction_result.metadata.get("accepted_train_platform_count", 0)),
+                "accepted_valid_platform_count": int(friction_result.metadata.get("accepted_valid_platform_count", 0)),
+                "rejected_platform_count": int(friction_result.metadata.get("rejected_platform_count", 0)),
+            },
         )
     elif mode == "breakaway":
         validation_result = _empty_validation_result(status="breakaway_only")
@@ -1614,9 +2043,9 @@ def _run_mode(
                     f"inertia={float(identification.inertia.inertia):+.4f}"
                 )
 
-        summary_paths = store.save_summary(artifacts)
         if mode == "identify-all":
             store.save_latest_parameters(artifacts)
+        summary_paths = store.save_summary(artifacts)
         rerun_recorder.log_summary(
             summary_path=summary_paths.run_summary_path,
             report_path=summary_paths.run_summary_report_path,
@@ -1709,6 +2138,12 @@ def run_compensation(
             f"Warning: motor_id={int(target_motor_id)} latest model is not recommended_for_compensation, "
             f"source_run_label={parameters.source_run_label}"
         )
+    if str(parameters.publish_status) != "published":
+        log_info(
+            f"Warning: motor_id={int(target_motor_id)} using unpublished model because "
+            f"compensation.require_published_model={str(bool(config.compensation.require_published_model)).lower()}, "
+            f"publish_status={parameters.publish_status}"
+        )
 
     store = ResultStore(config, mode="compensation")
     parser = FeedbackFrameParser(max_motor_id=max(config.motor_ids))
@@ -1742,7 +2177,10 @@ def run_compensation(
             sync_wait_duration_s=0.0,
             round_total_duration_s=0.0,
         )
-        log_info(f"Starting compensation round 1/1: motor_id={int(target_motor_id)}")
+        log_info(
+            f"Starting compensation round 1/1: motor_id={int(target_motor_id)}, "
+            f"source_run_label={parameters.source_run_label}, publish_status={parameters.publish_status}"
+        )
         round_started = time.monotonic()
         _run_compensation_phase(
             config=config,
@@ -1767,6 +2205,11 @@ def run_compensation(
                 "latest_parameters_path": str(latest_parameters_path(config)),
                 "identified_at": str(parameters.identified_at),
                 "source_run_label": str(parameters.source_run_label),
+                "model_kind": str(parameters.model_kind),
+                "publish_status": str(parameters.publish_status),
+                "publish_detail": str(parameters.publish_detail),
+                "accepted_round_count": int(parameters.accepted_round_count),
+                "selected_rounds": list(parameters.selected_rounds),
                 "recommended_for_compensation": bool(parameters.recommended_for_compensation),
             },
         )

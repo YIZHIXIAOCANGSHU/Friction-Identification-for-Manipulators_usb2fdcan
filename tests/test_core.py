@@ -57,8 +57,18 @@ class CoreConfigAndTransportTests(unittest.TestCase):
         self.assertEqual(config.breakaway.hold_duration, 0.25)
         self.assertEqual(config.identification.repeat_count, 3)
         self.assertEqual(config.identification.steady_speed_points, (0.5, 1.0, 2.0, 4.0, 6.0, 8.0))
+        self.assertEqual(config.identification.min_tracking_ratio, 0.75)
+        self.assertEqual(config.identification.max_steady_velocity_std_ratio, 0.15)
+        self.assertEqual(config.identification.min_publishable_rounds, 2)
+        self.assertTrue(config.compensation.require_published_model)
+        self.assertEqual(config.compensation.torque_limit_ratio, 0.35)
+        self.assertEqual(config.compensation.torque_slew_rate_nm_s, 4.0)
+        self.assertEqual(config.compensation.static_assist_ratio_cap, 1.5)
+        self.assertEqual(config.compensation.soft_abort_start_ratio, 0.60)
+        self.assertEqual(config.compensation.soft_abort_stop_ratio, 0.85)
+        self.assertEqual(config.compensation.max_inertia_torque_ratio, 0.25)
+        self.assertEqual(config.compensation.direction_hold_samples, 3)
         self.assertEqual(config.output.latest_parameters_json_filename, "latest_motor_parameters.json")
-        self.assertFalse(hasattr(config.mit_velocity, "soft_speed_limit"))
 
     def test_legacy_sections_are_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

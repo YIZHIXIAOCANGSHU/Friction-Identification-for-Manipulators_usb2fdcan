@@ -19,6 +19,35 @@ def _rmse(y_true: np.ndarray, y_pred: np.ndarray, mask: np.ndarray) -> float:
     return float(np.sqrt(np.mean(residual**2)))
 
 
+def _robust_refit_mask(
+    design: np.ndarray,
+    target: np.ndarray,
+    train_mask: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    active_mask = np.asarray(train_mask, dtype=bool).reshape(-1).copy()
+    residual_mask = np.zeros_like(active_mask, dtype=bool)
+    if np.count_nonzero(active_mask) < 4:
+        return active_mask, residual_mask
+
+    coefficients, *_ = np.linalg.lstsq(design[active_mask], target[active_mask], rcond=None)
+    prediction = np.asarray(design @ coefficients, dtype=np.float64)
+    residual = np.abs(target - prediction)
+    active_residual = residual[active_mask]
+    if active_residual.size == 0:
+        return active_mask, residual_mask
+    median = float(np.median(active_residual))
+    mad = float(np.median(np.abs(active_residual - median)))
+    sigma = 1.4826 * mad
+    if not np.isfinite(sigma) or sigma <= 1.0e-9:
+        return active_mask, residual_mask
+    threshold = median + 3.0 * sigma
+    robust_mask = active_mask & (residual <= threshold)
+    if np.count_nonzero(robust_mask) >= 3 and np.count_nonzero(robust_mask) < np.count_nonzero(active_mask):
+        residual_mask = active_mask & ~robust_mask
+        return robust_mask, residual_mask
+    return active_mask, residual_mask
+
+
 def _smooth_signal(signal: np.ndarray, *, window: int, polyorder: int) -> np.ndarray:
     signal = np.asarray(signal, dtype=np.float64).reshape(-1)
     if signal.size < 3:
@@ -87,18 +116,22 @@ def fit_friction_model(
             metadata=metadata,
         )
 
-    design = np.column_stack([np.sign(velocity[train_mask]), velocity[train_mask], np.ones(np.count_nonzero(train_mask))])
-    coefficients, *_ = np.linalg.lstsq(design, torque[train_mask], rcond=None)
+    full_design = np.column_stack([np.sign(velocity), velocity, np.ones(velocity.size)])
+    fit_train_mask, rejected_train_mask = _robust_refit_mask(full_design, torque, train_mask)
+    design = full_design[fit_train_mask]
+    coefficients, *_ = np.linalg.lstsq(design, torque[fit_train_mask], rcond=None)
     tau_c, viscous, tau_bias = [float(item) for item in coefficients.tolist()]
     torque_pred = friction_torque_model(velocity, tau_c=tau_c, viscous=viscous, tau_bias=tau_bias)
     metadata["status"] = "ok"
+    metadata["fit_train_sample_count"] = int(np.count_nonzero(fit_train_mask))
+    metadata["rejected_train_sample_count"] = int(np.count_nonzero(rejected_train_mask))
     return FrictionIdentificationResult(
         tau_c=tau_c,
         viscous=viscous,
         tau_bias=tau_bias,
-        train_rmse=_rmse(torque, torque_pred, train_mask),
+        train_rmse=_rmse(torque, torque_pred, fit_train_mask),
         valid_rmse=_rmse(torque, torque_pred, valid_mask),
-        train_mask=train_mask,
+        train_mask=fit_train_mask,
         valid_mask=valid_mask,
         torque_pred=np.asarray(torque_pred, dtype=np.float64),
         torque_target=torque,

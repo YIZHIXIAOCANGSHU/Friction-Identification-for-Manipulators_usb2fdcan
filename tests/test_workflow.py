@@ -8,6 +8,15 @@ from pathlib import Path
 
 import numpy as np
 
+from friction_identification_core.core import (
+    BreakawayIdentificationResult,
+    FrictionIdentificationResult,
+    InertiaIdentificationResult,
+    MotorIdentificationResult,
+    RoundCapture,
+    ValidationResult,
+)
+from friction_identification_core.results import ResultStore, RoundArtifact
 from friction_identification_core.runtime_config import DEFAULT_CONFIG_PATH, load_config
 from friction_identification_core.workflow import run_breakaway, run_compensation, run_identify_all
 from friction_identification_core.io import RECV_FRAME_HEAD, RECV_FRAME_STRUCT
@@ -361,9 +370,203 @@ class StaticBreakawayAssistFakeTransport(ClosedLoopFakeTransport):
         return state, float(position), float(velocity), float(torque_feedback), 30.0 + float(motor_id)
 
 
+class TrackingLossFakeTransport(ClosedLoopFakeTransport):
+    def __init__(
+        self,
+        motor_ids: tuple[int, ...],
+        *,
+        low_speed_scale: float = 0.44,
+        holdout_speed_scale: float = 0.70,
+    ) -> None:
+        super().__init__(
+            motor_ids,
+            dt=0.005,
+            static_threshold=0.12,
+            tau_c=0.22,
+            tau_bias=0.0,
+            viscous=0.02,
+            inertia=0.06,
+            velocity_gain=2.4,
+        )
+        self._low_speed_scale = float(low_speed_scale)
+        self._holdout_speed_scale = float(holdout_speed_scale)
+
+    def _advance_motor(self, motor_id: int) -> tuple[int, float, float, float, float]:
+        item = self._state[int(motor_id)]
+        velocity = float(item["velocity"])
+        position = float(item["position"])
+        if not bool(item["enabled"]):
+            velocity *= 0.7
+            torque_feedback = 0.0
+            state = 0
+        else:
+            state = 1
+            mode = str(item["mode"])
+            if mode == "mit_torque":
+                applied_torque = float(item["torque_cmd"])
+            else:
+                commanded_velocity = float(item["velocity_cmd"])
+                tracking_scale = 1.0
+                if abs(commanded_velocity) <= 0.5 + 1.0e-9:
+                    tracking_scale = self._low_speed_scale
+                elif abs(commanded_velocity) >= 8.0 - 1.0e-9:
+                    tracking_scale = self._holdout_speed_scale
+                effective_velocity_cmd = tracking_scale * commanded_velocity
+                gain = self._velocity_gain * (1.0 + float(item["kd"]))
+                applied_torque = float(np.clip(gain * (effective_velocity_cmd - velocity), -2.5, 2.5))
+            torque_feedback = float(applied_torque)
+            direction = np.sign(velocity) if abs(velocity) > 1.0e-4 else np.sign(applied_torque)
+            friction = self._tau_c * direction + self._viscous * velocity + self._tau_bias
+            if mode == "mit_torque" and abs(applied_torque) <= self._static_threshold and abs(velocity) < 0.05:
+                velocity *= 0.8
+            else:
+                acceleration = (applied_torque - friction) / self._inertia
+                velocity += self._dt * acceleration
+            position += self._dt * velocity
+        item["position"] = float(position)
+        item["velocity"] = float(velocity)
+        item["torque_feedback"] = float(torque_feedback)
+        return state, float(position), float(velocity), float(torque_feedback), 30.0 + float(motor_id)
+
+
+class OscillatingCompensationFakeTransport(ClosedLoopFakeTransport):
+    def __init__(self, motor_ids: tuple[int, ...]) -> None:
+        super().__init__(
+            motor_ids,
+            dt=0.005,
+            static_threshold=0.5,
+            tau_c=0.0,
+            tau_bias=0.0,
+            viscous=0.0,
+            inertia=0.2,
+            velocity_gain=1.5,
+            torque_limit=2.5,
+        )
+        self._oscillation_active = False
+        self._oscillation_step = 0
+
+    def send_mit_torque(self, motor_id: int, torque: float) -> bytes:
+        if abs(float(torque)) > 0.0:
+            self._oscillation_active = True
+        return super().send_mit_torque(motor_id, torque)
+
+    def _advance_motor(self, motor_id: int) -> tuple[int, float, float, float, float]:
+        state, position, velocity, torque_feedback, mos_temperature = super()._advance_motor(motor_id)
+        if self._oscillation_active and int(motor_id) == 1 and state == 1:
+            self._oscillation_step += 1
+            velocity = 7.2 + 0.6 * np.sin(0.9 * float(self._oscillation_step))
+            position += self._dt * velocity
+            self._state[int(motor_id)]["position"] = float(position)
+            self._state[int(motor_id)]["velocity"] = float(velocity)
+            self._state[int(motor_id)]["torque_feedback"] = float(torque_feedback)
+        return state, float(position), float(velocity), float(torque_feedback), float(mos_temperature)
+
+
+class CompensationSoftAbortFakeTransport(ClosedLoopFakeTransport):
+    def __init__(self, motor_ids: tuple[int, ...], *, trip_velocity: float = 8.7) -> None:
+        super().__init__(
+            motor_ids,
+            trip_motor_id=1,
+            trip_command_threshold=0.05,
+            trip_velocity=trip_velocity,
+            torque_limit=2.5,
+        )
+
+
 class WorkflowTests(unittest.TestCase):
     def _base_config(self):
         return load_config(DEFAULT_CONFIG_PATH)
+
+    def _synthetic_artifact(
+        self,
+        *,
+        motor_id: int,
+        group_index: int,
+        tau_static: float,
+        tau_c: float,
+        viscous: float,
+        inertia: float,
+        friction_rmse: float,
+        inertia_rmse: float,
+        recommended: bool,
+        tmpdir: str,
+    ) -> RoundArtifact:
+        capture = RoundCapture(
+            group_index=int(group_index),
+            round_index=int(group_index),
+            target_motor_id=int(motor_id),
+            motor_name=f"motor_{int(motor_id):02d}",
+            time=np.asarray([0.0], dtype=np.float64),
+            motor_id=np.asarray([int(motor_id)], dtype=np.int64),
+            position=np.asarray([0.0], dtype=np.float64),
+            velocity=np.asarray([0.0], dtype=np.float64),
+            torque_feedback=np.asarray([0.0], dtype=np.float64),
+            command_raw=np.asarray([0.0], dtype=np.float64),
+            command=np.asarray([0.0], dtype=np.float64),
+            position_cmd=np.asarray([0.0], dtype=np.float64),
+            velocity_cmd=np.asarray([0.0], dtype=np.float64),
+            acceleration_cmd=np.asarray([0.0], dtype=np.float64),
+            phase_name=np.asarray(["synthetic"], dtype=str),
+            state=np.asarray([1], dtype=np.uint8),
+            mos_temperature=np.asarray([30.0], dtype=np.float64),
+            id_match_ok=np.asarray([True], dtype=bool),
+            filtered_velocity=np.asarray([0.0], dtype=np.float64),
+            estimated_acceleration=np.asarray([0.0], dtype=np.float64),
+            friction_term=np.asarray([0.0], dtype=np.float64),
+            inertia_term=np.asarray([0.0], dtype=np.float64),
+            guard_scale=np.asarray([1.0], dtype=np.float64),
+            metadata={"mode": "identify-all"},
+        )
+        identification = MotorIdentificationResult(
+            motor_id=int(motor_id),
+            motor_name=f"motor_{int(motor_id):02d}",
+            breakaway=BreakawayIdentificationResult(
+                torque_positive=float(tau_static),
+                torque_negative=-float(tau_static),
+                tau_static=float(tau_static),
+                tau_bias=0.0,
+                metadata={},
+            ),
+            friction=FrictionIdentificationResult(
+                tau_c=float(tau_c),
+                viscous=float(viscous),
+                tau_bias=0.0,
+                train_rmse=float(friction_rmse),
+                valid_rmse=float(friction_rmse),
+                train_mask=np.asarray([True], dtype=bool),
+                valid_mask=np.asarray([True], dtype=bool),
+                torque_pred=np.asarray([0.0], dtype=np.float64),
+                torque_target=np.asarray([0.0], dtype=np.float64),
+                metadata={"status": "accepted" if recommended else "rejected"},
+            ),
+            inertia=InertiaIdentificationResult(
+                inertia=float(inertia),
+                train_rmse=float(inertia_rmse),
+                valid_rmse=float(inertia_rmse),
+                train_mask=np.asarray([True], dtype=bool),
+                valid_mask=np.asarray([True], dtype=bool),
+                torque_pred=np.asarray([0.0], dtype=np.float64),
+                torque_target=np.asarray([0.0], dtype=np.float64),
+                filtered_velocity=np.asarray([0.0], dtype=np.float64),
+                acceleration=np.asarray([0.0], dtype=np.float64),
+                metadata={"status": "accepted" if recommended else "rejected"},
+            ),
+            validation=ValidationResult(
+                friction_rmse=float(friction_rmse),
+                inertia_rmse=float(inertia_rmse),
+                recommended_for_compensation=bool(recommended),
+                detail="accepted" if recommended else "rejected",
+                metadata={"status": "accepted" if recommended else "rejected"},
+            ),
+            metadata={"mode": "identify-all"},
+        )
+        artifact_dir = Path(tmpdir)
+        return RoundArtifact(
+            capture=capture,
+            identification=identification,
+            capture_path=artifact_dir / f"capture_{int(motor_id)}_{int(group_index)}.npz",
+            identification_path=artifact_dir / f"identification_{int(motor_id)}_{int(group_index)}.npz",
+        )
 
     def test_identify_all_generates_capture_and_summary(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -401,6 +604,7 @@ class WorkflowTests(unittest.TestCase):
                     repeat_count=1,
                     savgol_window=9,
                     savgol_polyorder=2,
+                    min_publishable_rounds=1,
                 ),
                 output=replace(base_config.output, results_dir=Path(tmpdir)),
             )
@@ -476,6 +680,7 @@ class WorkflowTests(unittest.TestCase):
                         repeat_count=1,
                         savgol_window=9,
                         savgol_polyorder=2,
+                        min_publishable_rounds=1,
                     ),
                     output=replace(base_config.output, results_dir=Path(tmpdir)),
                 )
@@ -504,6 +709,192 @@ class WorkflowTests(unittest.TestCase):
                 Path(result_2.manifest_path).parent.name,
             )
 
+    def test_identify_all_rejects_undertracked_platforms_from_publishable_model(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            base_config = self._base_config()
+            config = replace(
+                base_config,
+                motors=replace(base_config.motors, enabled_ids=(3,)),
+                transport=replace(
+                    base_config.transport,
+                    read_timeout=0.001,
+                    read_chunk_size=RECV_FRAME_STRUCT.size * len(base_config.motor_ids),
+                    sync_timeout=0.05,
+                ),
+                safety=replace(
+                    base_config.safety,
+                    moving_hold_ms=5,
+                    post_abort_disable_delay_ms=10,
+                ),
+                breakaway=replace(
+                    base_config.breakaway,
+                    torque_step=0.02,
+                    hold_duration=0.02,
+                    scan_max_torque=np.asarray([0.24, 0.80, 0.60, 0.60, 0.40, 0.40, 0.40], dtype=np.float64),
+                ),
+                mit_velocity=replace(
+                    base_config.mit_velocity,
+                    kd_speed=np.asarray([0.8, 1.0, 0.8, 0.8, 0.6, 0.6, 0.6], dtype=np.float64),
+                    ramp_acceleration=40.0,
+                    steady_hold_duration=0.03,
+                    steady_window_ratio=0.5,
+                ),
+                identification=replace(
+                    base_config.identification,
+                    steady_speed_points=(0.5, 1.0, 2.0, 4.0, 8.0),
+                    repeat_count=1,
+                    savgol_window=9,
+                    savgol_polyorder=2,
+                    min_publishable_rounds=1,
+                ),
+                output=replace(base_config.output, results_dir=Path(tmpdir)),
+            )
+
+            result = run_identify_all(
+                config,
+                transport_factory=lambda: TrackingLossFakeTransport(motor_ids=base_config.motor_ids),
+                show_rerun_viewer=False,
+            )
+
+            identification = result.artifacts[0].identification
+            self.assertFalse(identification.validation.recommended_for_compensation)
+            self.assertEqual(identification.validation.metadata["status"], "rejected")
+            self.assertGreaterEqual(int(identification.friction.metadata["rejected_platform_count"]), 2)
+            self.assertEqual(int(identification.friction.metadata["accepted_valid_platform_count"]), 0)
+
+            latest_path = Path(tmpdir) / "latest_motor_parameters.json"
+            payload = json.loads(latest_path.read_text(encoding="utf-8"))
+            self.assertNotIn("3", payload["motors"])
+
+    def test_save_latest_parameters_uses_only_accepted_rounds_and_preserves_previous_model(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            base_config = self._base_config()
+            config = replace(
+                base_config,
+                motors=replace(base_config.motors, enabled_ids=(1, 2)),
+                identification=replace(
+                    base_config.identification,
+                    repeat_count=3,
+                    min_publishable_rounds=2,
+                ),
+                output=replace(base_config.output, results_dir=Path(tmpdir)),
+            )
+            latest_path = Path(tmpdir) / "latest_motor_parameters.json"
+            latest_path.write_text(
+                json.dumps(
+                    {
+                        "updated_at": "2026-04-24T00:00:00+00:00",
+                        "results_dir": str(Path(tmpdir)),
+                        "speed_limit_rad_s": 10.0,
+                        "motors": {
+                            "2": {
+                                "motor_id": 2,
+                                "motor_name": "motor_02",
+                                "identified_at": "2026-04-24T00:00:00+00:00",
+                                "source_run_label": "seed_run",
+                                "tau_static": 0.5,
+                                "tau_bias": 0.0,
+                                "tau_c": 0.21,
+                                "viscous": 0.03,
+                                "inertia": 0.02,
+                                "friction_validation_rmse": 0.03,
+                                "inertia_validation_rmse": 0.04,
+                                "repeat_consistency_score": 0.02,
+                                "recommended_for_compensation": True,
+                                "model_kind": "static_v1",
+                                "publish_status": "published",
+                                "publish_detail": "seed model",
+                                "accepted_round_count": 2,
+                                "selected_rounds": [1, 2],
+                            }
+                        },
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+
+            artifacts = [
+                self._synthetic_artifact(
+                    motor_id=1,
+                    group_index=1,
+                    tau_static=0.20,
+                    tau_c=0.10,
+                    viscous=0.01,
+                    inertia=0.02,
+                    friction_rmse=0.02,
+                    inertia_rmse=0.03,
+                    recommended=True,
+                    tmpdir=tmpdir,
+                ),
+                self._synthetic_artifact(
+                    motor_id=1,
+                    group_index=2,
+                    tau_static=0.24,
+                    tau_c=0.14,
+                    viscous=0.02,
+                    inertia=0.03,
+                    friction_rmse=0.02,
+                    inertia_rmse=0.03,
+                    recommended=True,
+                    tmpdir=tmpdir,
+                ),
+                self._synthetic_artifact(
+                    motor_id=1,
+                    group_index=3,
+                    tau_static=0.90,
+                    tau_c=0.60,
+                    viscous=0.20,
+                    inertia=0.30,
+                    friction_rmse=0.40,
+                    inertia_rmse=0.35,
+                    recommended=False,
+                    tmpdir=tmpdir,
+                ),
+                self._synthetic_artifact(
+                    motor_id=2,
+                    group_index=1,
+                    tau_static=0.32,
+                    tau_c=0.18,
+                    viscous=0.02,
+                    inertia=0.01,
+                    friction_rmse=0.02,
+                    inertia_rmse=0.03,
+                    recommended=True,
+                    tmpdir=tmpdir,
+                ),
+                self._synthetic_artifact(
+                    motor_id=2,
+                    group_index=2,
+                    tau_static=0.70,
+                    tau_c=0.45,
+                    viscous=0.12,
+                    inertia=0.18,
+                    friction_rmse=0.35,
+                    inertia_rmse=0.28,
+                    recommended=False,
+                    tmpdir=tmpdir,
+                ),
+            ]
+            store = ResultStore(config, mode="identify-all")
+            store.save_summary(artifacts)
+            store.save_latest_parameters(artifacts)
+
+            payload = json.loads(latest_path.read_text(encoding="utf-8"))
+            motor_1 = payload["motors"]["1"]
+            self.assertAlmostEqual(float(motor_1["tau_static"]), 0.22, places=6)
+            self.assertAlmostEqual(float(motor_1["tau_c"]), 0.12, places=6)
+            self.assertAlmostEqual(float(motor_1["viscous"]), 0.015, places=6)
+            self.assertAlmostEqual(float(motor_1["inertia"]), 0.025, places=6)
+            self.assertEqual(motor_1["publish_status"], "published")
+            self.assertEqual(motor_1["accepted_round_count"], 2)
+            self.assertEqual(motor_1["selected_rounds"], [1, 2])
+
+            motor_2 = payload["motors"]["2"]
+            self.assertEqual(motor_2["source_run_label"], "seed_run")
+            self.assertAlmostEqual(float(motor_2["tau_c"]), 0.21, places=6)
+
     def test_compensation_requires_latest_parameters(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             base_config = self._base_config()
@@ -514,6 +905,53 @@ class WorkflowTests(unittest.TestCase):
             )
             with self.assertRaisesRegex(ValueError, "latest motor parameters"):
                 run_compensation(config, transport_factory=lambda: ClosedLoopFakeTransport(motor_ids=base_config.motor_ids), show_rerun_viewer=False, max_runtime_s=0.01)
+
+    def test_compensation_requires_published_model_by_default(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            base_config = self._base_config()
+            latest_path = Path(tmpdir) / "latest_motor_parameters.json"
+            latest_path.write_text(
+                json.dumps(
+                    {
+                        "updated_at": "2026-04-25T00:00:00+00:00",
+                        "results_dir": str(Path(tmpdir)),
+                        "speed_limit_rad_s": 10.0,
+                        "motors": {
+                            "1": {
+                                "motor_id": 1,
+                                "motor_name": "motor_01",
+                                "identified_at": "2026-04-25T00:00:00+00:00",
+                                "source_run_label": "seed_run",
+                                "tau_static": 0.12,
+                                "tau_bias": 0.01,
+                                "tau_c": 0.18,
+                                "viscous": 0.04,
+                                "inertia": 0.08,
+                                "friction_validation_rmse": 0.25,
+                                "inertia_validation_rmse": 0.30,
+                                "repeat_consistency_score": 0.40,
+                                "recommended_for_compensation": False,
+                            }
+                        },
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+            config = replace(
+                base_config,
+                motors=replace(base_config.motors, enabled_ids=(1,)),
+                output=replace(base_config.output, results_dir=Path(tmpdir)),
+            )
+
+            with self.assertRaisesRegex(ValueError, "published model"):
+                run_compensation(
+                    config,
+                    transport_factory=lambda: ClosedLoopFakeTransport(motor_ids=base_config.motor_ids),
+                    show_rerun_viewer=False,
+                    max_runtime_s=0.01,
+                )
 
     def test_compensation_uses_latest_parameters_and_saves_capture_only(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -567,6 +1005,7 @@ class WorkflowTests(unittest.TestCase):
                     savgol_window=9,
                     savgol_polyorder=2,
                 ),
+                compensation=replace(base_config.compensation, require_published_model=False),
                 output=replace(base_config.output, results_dir=Path(tmpdir)),
             )
             transport = ClosedLoopFakeTransport(
@@ -641,6 +1080,7 @@ class WorkflowTests(unittest.TestCase):
                     savgol_window=9,
                     savgol_polyorder=2,
                 ),
+                compensation=replace(base_config.compensation, require_published_model=False),
                 output=replace(base_config.output, results_dir=Path(tmpdir)),
             )
             transport = CommandTriggeredFeedbackFakeTransport(
@@ -724,8 +1164,150 @@ class WorkflowTests(unittest.TestCase):
             )
 
             with np.load(result.artifacts[0], allow_pickle=False) as capture:
-                self.assertGreater(float(np.max(capture["command"])), 0.5)
-                self.assertGreater(float(np.max(capture["velocity"])), 0.0)
+                self.assertGreater(float(np.max(capture["command"])), 0.15)
+                self.assertLessEqual(float(np.max(capture["command"])), 0.18 + 1.0e-6)
+                self.assertGreater(float(np.max(capture["friction_term"])), 0.15)
+
+    def test_compensation_limits_static_friction_inertia_and_total_command(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            base_config = self._base_config()
+            latest_path = Path(tmpdir) / "latest_motor_parameters.json"
+            latest_path.write_text(
+                json.dumps(
+                    {
+                        "updated_at": "2026-04-25T00:00:00+00:00",
+                        "results_dir": str(Path(tmpdir)),
+                        "speed_limit_rad_s": 10.0,
+                        "motors": {
+                            "1": {
+                                "motor_id": 1,
+                                "motor_name": "motor_01",
+                                "identified_at": "2026-04-25T00:00:00+00:00",
+                                "source_run_label": "seed_run",
+                                "tau_static": 2.0,
+                                "tau_bias": 0.0,
+                                "tau_c": 0.2,
+                                "viscous": 0.0,
+                                "inertia": 1.5,
+                                "friction_validation_rmse": 0.01,
+                                "inertia_validation_rmse": 0.02,
+                                "repeat_consistency_score": 0.03,
+                                "recommended_for_compensation": True,
+                                "publish_status": "published",
+                            }
+                        },
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+            config = replace(
+                base_config,
+                motors=replace(base_config.motors, enabled_ids=(1,)),
+                transport=replace(
+                    base_config.transport,
+                    read_timeout=0.001,
+                    read_chunk_size=RECV_FRAME_STRUCT.size * len(base_config.motor_ids),
+                    sync_timeout=0.05,
+                ),
+                safety=replace(
+                    base_config.safety,
+                    moving_hold_ms=5,
+                    post_abort_disable_delay_ms=10,
+                ),
+                identification=replace(
+                    base_config.identification,
+                    savgol_window=9,
+                    savgol_polyorder=2,
+                ),
+                output=replace(base_config.output, results_dir=Path(tmpdir)),
+            )
+            transport = OscillatingCompensationFakeTransport(motor_ids=base_config.motor_ids)
+
+            result = run_compensation(
+                config,
+                transport_factory=lambda: transport,
+                show_rerun_viewer=False,
+                max_runtime_s=0.05,
+            )
+
+            with np.load(result.artifacts[0], allow_pickle=False) as capture:
+                self.assertIn("filtered_velocity", capture.files)
+                self.assertIn("estimated_acceleration", capture.files)
+                self.assertIn("friction_term", capture.files)
+                self.assertIn("inertia_term", capture.files)
+                self.assertIn("guard_scale", capture.files)
+                self.assertLessEqual(float(np.max(np.abs(capture["friction_term"]))), 0.300001)
+                self.assertLessEqual(float(np.max(np.abs(capture["inertia_term"]))), 0.218751)
+                self.assertLessEqual(float(np.max(np.abs(capture["command"]))), 0.875001)
+                self.assertTrue(np.all(np.isfinite(capture["guard_scale"])))
+                self.assertTrue(np.all(capture["guard_scale"] <= 1.0))
+
+    def test_compensation_soft_abort_triggers_before_hard_speed_limit(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            base_config = self._base_config()
+            latest_path = Path(tmpdir) / "latest_motor_parameters.json"
+            latest_path.write_text(
+                json.dumps(
+                    {
+                        "updated_at": "2026-04-25T00:00:00+00:00",
+                        "results_dir": str(Path(tmpdir)),
+                        "speed_limit_rad_s": 10.0,
+                        "motors": {
+                            "1": {
+                                "motor_id": 1,
+                                "motor_name": "motor_01",
+                                "identified_at": "2026-04-25T00:00:00+00:00",
+                                "source_run_label": "seed_run",
+                                "tau_static": 0.60,
+                                "tau_bias": 0.0,
+                                "tau_c": 0.18,
+                                "viscous": 0.0,
+                                "inertia": 0.0,
+                                "friction_validation_rmse": 0.01,
+                                "inertia_validation_rmse": 0.02,
+                                "repeat_consistency_score": 0.03,
+                                "recommended_for_compensation": True,
+                                "publish_status": "published",
+                            }
+                        },
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+            config = replace(
+                base_config,
+                motors=replace(base_config.motors, enabled_ids=(1,)),
+                transport=replace(
+                    base_config.transport,
+                    read_timeout=0.001,
+                    read_chunk_size=RECV_FRAME_STRUCT.size * len(base_config.motor_ids),
+                    sync_timeout=0.05,
+                ),
+                safety=replace(
+                    base_config.safety,
+                    moving_hold_ms=5,
+                    post_abort_disable_delay_ms=10,
+                ),
+                identification=replace(
+                    base_config.identification,
+                    savgol_window=9,
+                    savgol_polyorder=2,
+                ),
+                output=replace(base_config.output, results_dir=Path(tmpdir)),
+            )
+            transport = CompensationSoftAbortFakeTransport(motor_ids=base_config.motor_ids)
+
+            with self.assertRaisesRegex(RuntimeError, r"reason=soft_speed_abort"):
+                run_compensation(
+                    config,
+                    transport_factory=lambda: transport,
+                    show_rerun_viewer=False,
+                    max_runtime_s=0.05,
+                )
 
     def test_breakaway_hard_abort_sends_zero_then_disable(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
