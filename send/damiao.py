@@ -553,7 +553,7 @@ class DamiaoSocketCanTransport:
         raise ValueError(f"Unknown motor_id: {target_motor_id}")
 
     def _mode_for_semantic(self, semantic_mode: str) -> Control_Mode:
-        if semantic_mode in {"mit_torque", "mit_velocity"}:
+        if semantic_mode in {"mit_torque", "mit_velocity", "mit_state"}:
             return Control_Mode.MIT_MODE
         if semantic_mode == "velocity_mode":
             return Control_Mode.VEL_MODE
@@ -694,8 +694,36 @@ class DamiaoSocketCanTransport:
         torque_ff: float = 0.0,
         position: float = 0.0,
     ) -> bytes:
+        packet = self.send_mit_state(
+            motor_id,
+            position=float(position),
+            velocity=float(velocity),
+            kp=float(kp),
+            kd=float(kd),
+            torque_ff=float(torque_ff),
+        )
+        self._last_mit_velocity_kd[int(motor_id)] = float(kd)
+        return packet
+
+    def send_mit_state(
+        self,
+        motor_id: int,
+        position: float,
+        velocity: float,
+        kp: float,
+        kd: float,
+        torque_ff: float = 0.0,
+    ) -> bytes:
+        if not np.isfinite(float(position)):
+            raise ValueError("position must be finite")
         if not np.isfinite(float(velocity)):
             raise ValueError("velocity must be finite")
+        if not np.isfinite(float(kp)) or float(kp) < 0.0:
+            raise ValueError("kp must be finite and >= 0")
+        if not np.isfinite(float(kd)) or float(kd) < 0.0:
+            raise ValueError("kd must be finite and >= 0")
+        if not np.isfinite(float(torque_ff)):
+            raise ValueError("torque_ff must be finite")
         mapping = self._mapping_for_motor_id(motor_id)
         packet = bytearray()
         packet.extend(self._ensure_mode(mapping, Control_Mode.MIT_MODE))
@@ -710,7 +738,6 @@ class DamiaoSocketCanTransport:
             float(limited_torque),
         )
         packet.extend(self._send_with_retry(can_id, payload))
-        self._last_mit_velocity_kd[int(mapping.motor_id)] = float(kd)
         return bytes(packet)
 
     def send_velocity_mode(self, motor_id: int, velocity: float) -> bytes:
@@ -729,6 +756,9 @@ class DamiaoSocketCanTransport:
         if semantic_mode == "mit_velocity":
             kd = float(self._last_mit_velocity_kd.get(int(motor_id), 0.0))
             return self.send_mit_velocity(motor_id, 0.0, kd, kp=0.0, torque_ff=0.0, position=0.0)
+        if semantic_mode == "mit_state":
+            kd = float(self._last_mit_velocity_kd.get(int(motor_id), 0.0))
+            return self.send_mit_state(motor_id, 0.0, 0.0, 0.0, kd, torque_ff=0.0)
         if semantic_mode == "velocity_mode":
             return self.send_velocity_mode(motor_id, 0.0)
         raise ValueError(f"Unsupported semantic_mode: {semantic_mode}")

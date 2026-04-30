@@ -118,6 +118,14 @@ def _top_level_tab_names(blueprint: object) -> list[str]:
     return [str(child.kwargs.get("name", "")) for child in tabs.children if isinstance(child, _FakeBlueprintNode)]
 
 
+def _contains_node_named(node: object, *, kind: str, name: str) -> bool:
+    if isinstance(node, _FakeBlueprintNode):
+        if node.kind == kind and node.kwargs.get("name") == name:
+            return True
+        return any(_contains_node_named(child, kind=kind, name=name) for child in node.children)
+    return False
+
+
 def _contains_time_series_content(node: object, *, content: str) -> bool:
     if isinstance(node, _FakeBlueprintNode):
         values = node.kwargs.get("contents", [])
@@ -144,7 +152,9 @@ class VisualizationTests(unittest.TestCase):
             blueprint, make_active, make_default = recording.blueprints[-1]
             self.assertTrue(make_active)
             self.assertTrue(make_default)
-            self.assertEqual(_top_level_tab_names(blueprint)[0], "Feedback Frames")
+            self.assertEqual(_top_level_tab_names(blueprint), ["Overview", "Feedback Frames", "Motors", "Summary"])
+            self.assertTrue(_contains_node_named(blueprint, kind="Vertical", name="motor_01"))
+            self.assertTrue(_contains_node_named(blueprint, kind="Vertical", name="motor_02"))
             self.assertTrue(
                 _contains_node_with_origin(
                     blueprint,
@@ -194,6 +204,58 @@ class VisualizationTests(unittest.TestCase):
             self.assertIn("live/motors/motor_02/position", logged_paths)
             self.assertIn("live/motors/motor_02/velocity", logged_paths)
             self.assertIn("live/motors/motor_02/torque", logged_paths)
+
+    def test_rerun_motor_sample_logging_writes_command_reference_fit_and_quality_series(self) -> None:
+        fake_rr = _fake_rr_module()
+        with tempfile.TemporaryDirectory() as tmpdir, mock.patch.object(visualization, "rr", fake_rr):
+            recorder = visualization.RerunRecorder(
+                Path(tmpdir) / "motor.rrd",
+                motor_ids=(1,),
+                motor_names={1: "motor_01"},
+                mode="identify-all",
+                show_viewer=False,
+            )
+            recording = _FakeRecordingStream.instances[-1]
+
+            recorder.log_live_motor_sample(
+                group_index=1,
+                round_index=1,
+                active_motor_id=1,
+                motor_id=1,
+                position=1.0,
+                velocity=2.0,
+                feedback_torque=0.3,
+                command_raw=0.4,
+                command=0.35,
+                reference_position=1.1,
+                reference_velocity=2.2,
+                reference_acceleration=3.3,
+                velocity_limit=10.0,
+                torque_limit=2.5,
+                position_limit=12.5,
+                phase_name="dynamic_mit_train",
+                stage="dynamic-mit",
+                safety_margin_text="velocity_margin=+8.000000, command=+0.350000",
+                filtered_velocity=1.9,
+                estimated_acceleration=3.1,
+                friction_term=0.2,
+                inertia_term=0.1,
+                guard_scale=0.75,
+                tracking_ok=True,
+                safety_ok=True,
+                state_ok=True,
+                saturated=False,
+                used_for_fit=True,
+            )
+
+            logged_paths = {entry[0] for entry in recording.logs}
+            self.assertIn("live/motors/motor_01/command/raw", logged_paths)
+            self.assertIn("live/motors/motor_01/command/applied", logged_paths)
+            self.assertIn("live/motors/motor_01/reference/velocity", logged_paths)
+            self.assertIn("live/motors/motor_01/fit/filtered_velocity", logged_paths)
+            self.assertIn("live/motors/motor_01/fit/estimated_acceleration", logged_paths)
+            self.assertIn("live/motors/motor_01/quality/used_for_fit", logged_paths)
+            self.assertIn("live/motors/motor_01/events", logged_paths)
 
 
 if __name__ == "__main__":

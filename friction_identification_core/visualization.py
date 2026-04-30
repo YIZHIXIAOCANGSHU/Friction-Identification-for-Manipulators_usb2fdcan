@@ -46,7 +46,72 @@ class RerunRecorder:
         if self._recording is None:
             return
         rrb = rr.blueprint
-        motor_views = [
+        motor_views = []
+        for motor_id in self._motor_ids:
+            base_path = self._motor_series_path(motor_id)
+            motor_views.append(
+                rrb.Vertical(
+                    rrb.TextDocumentView(origin=f"{base_path}/state", name="State"),
+                    rrb.Horizontal(
+                        rrb.TimeSeriesView(
+                            origin="/",
+                            contents=[f"{base_path}/position", f"{base_path}/reference/position"],
+                            name="Position",
+                        ),
+                        rrb.TimeSeriesView(
+                            origin="/",
+                            contents=[f"{base_path}/velocity", f"{base_path}/reference/velocity"],
+                            name="Velocity",
+                        ),
+                        name="Motion",
+                    ),
+                    rrb.Horizontal(
+                        rrb.TimeSeriesView(
+                            origin="/",
+                            contents=[
+                                f"{base_path}/torque",
+                                f"{base_path}/command/raw",
+                                f"{base_path}/command/applied",
+                            ],
+                            name="Torque / Command",
+                        ),
+                        rrb.TimeSeriesView(
+                            origin="/",
+                            contents=[f"{base_path}/reference/acceleration", f"{base_path}/fit/estimated_acceleration"],
+                            name="Acceleration",
+                        ),
+                        name="Command And Dynamics",
+                    ),
+                    rrb.Horizontal(
+                        rrb.TimeSeriesView(
+                            origin="/",
+                            contents=[
+                                f"{base_path}/fit/filtered_velocity",
+                                f"{base_path}/fit/friction_term",
+                                f"{base_path}/fit/inertia_term",
+                                f"{base_path}/fit/guard_scale",
+                            ],
+                            name="Fit / Compensation",
+                        ),
+                        rrb.TimeSeriesView(
+                            origin="/",
+                            contents=[
+                                f"{base_path}/quality/tracking_ok",
+                                f"{base_path}/quality/safety_ok",
+                                f"{base_path}/quality/state_ok",
+                                f"{base_path}/quality/saturated",
+                                f"{base_path}/quality/used_for_fit",
+                            ],
+                            name="Quality Flags",
+                        ),
+                        name="Fit Quality",
+                    ),
+                    rrb.TextLogView(origin=f"{base_path}/events", name="Events"),
+                    name=self._motor_names[motor_id],
+                )
+            )
+
+        legacy_motor_views = [
             rrb.Horizontal(
                 rrb.TimeSeriesView(
                     origin="/",
@@ -70,17 +135,23 @@ class RerunRecorder:
         blueprint = rrb.Blueprint(
             rrb.Tabs(
                 rrb.Vertical(
+                    rrb.TextDocumentView(origin="/live/overview/current_state", name="Overview"),
+                    rrb.TextDocumentView(origin="/live/overview/raw_command_packet", name="Raw Packet"),
+                    rrb.TextDocumentView(origin="/live/overview/abort_event", name="Abort"),
+                    name="Overview",
+                ),
+                rrb.Vertical(
                     rrb.TextLogView(origin="/live/feedback_frames", name="Feedback Frames"),
                     name="Feedback Frames",
                 ),
                 rrb.Vertical(
-                    rrb.TextDocumentView(origin="/live/overview/current_state", name="Overview"),
-                    rrb.TextDocumentView(origin="/live/overview/raw_command_packet", name="Raw Packet"),
-                    name="Overview",
+                    rrb.Tabs(*motor_views),
+                    name="Motors",
                 ),
                 rrb.Vertical(
-                    *motor_views,
-                    name="Motor Signals",
+                    rrb.TextDocumentView(origin="/summary/static", name="Summary"),
+                    *legacy_motor_views,
+                    name="Summary",
                 ),
             ),
             auto_views=False,
@@ -248,31 +319,69 @@ class RerunRecorder:
         phase_name: str,
         stage: str,
         safety_margin_text: str,
+        filtered_velocity: float = float("nan"),
+        estimated_acceleration: float = float("nan"),
+        friction_term: float = float("nan"),
+        inertia_term: float = float("nan"),
+        guard_scale: float = float("nan"),
+        tracking_ok: bool = True,
+        safety_ok: bool = True,
+        state_ok: bool = True,
+        saturated: bool = False,
+        used_for_fit: bool = False,
+        stiction_evidence: bool = False,
     ) -> None:
-        _ = (
-            group_index,
-            round_index,
-            active_motor_id,
-            motor_id,
-            position,
-            velocity,
-            feedback_torque,
-            command_raw,
-            command,
-            reference_position,
-            reference_velocity,
-            reference_acceleration,
-            velocity_limit,
-            torque_limit,
-            position_limit,
-            phase_name,
-            stage,
-            safety_margin_text,
+        if self._recording is None:
+            return
+        base_path = self._motor_series_path(motor_id).lstrip("/")
+        self._recording.log(f"{base_path}/position", rr.Scalars([float(position)]))
+        self._recording.log(f"{base_path}/velocity", rr.Scalars([float(velocity)]))
+        self._recording.log(f"{base_path}/torque", rr.Scalars([float(feedback_torque)]))
+        self._recording.log(f"{base_path}/command/raw", rr.Scalars([float(command_raw)]))
+        self._recording.log(f"{base_path}/command/applied", rr.Scalars([float(command)]))
+        self._recording.log(f"{base_path}/reference/position", rr.Scalars([float(reference_position)]))
+        self._recording.log(f"{base_path}/reference/velocity", rr.Scalars([float(reference_velocity)]))
+        self._recording.log(f"{base_path}/reference/acceleration", rr.Scalars([float(reference_acceleration)]))
+        self._recording.log(f"{base_path}/limits/velocity", rr.Scalars([float(velocity_limit)]))
+        self._recording.log(f"{base_path}/limits/torque", rr.Scalars([float(torque_limit)]))
+        self._recording.log(f"{base_path}/limits/position", rr.Scalars([float(position_limit)]))
+        self._recording.log(f"{base_path}/fit/filtered_velocity", rr.Scalars([float(filtered_velocity)]))
+        self._recording.log(f"{base_path}/fit/estimated_acceleration", rr.Scalars([float(estimated_acceleration)]))
+        self._recording.log(f"{base_path}/fit/friction_term", rr.Scalars([float(friction_term)]))
+        self._recording.log(f"{base_path}/fit/inertia_term", rr.Scalars([float(inertia_term)]))
+        self._recording.log(f"{base_path}/fit/guard_scale", rr.Scalars([float(guard_scale)]))
+        self._recording.log(f"{base_path}/quality/tracking_ok", rr.Scalars([1.0 if bool(tracking_ok) else 0.0]))
+        self._recording.log(f"{base_path}/quality/safety_ok", rr.Scalars([1.0 if bool(safety_ok) else 0.0]))
+        self._recording.log(f"{base_path}/quality/state_ok", rr.Scalars([1.0 if bool(state_ok) else 0.0]))
+        self._recording.log(f"{base_path}/quality/saturated", rr.Scalars([1.0 if bool(saturated) else 0.0]))
+        self._recording.log(f"{base_path}/quality/used_for_fit", rr.Scalars([1.0 if bool(used_for_fit) else 0.0]))
+        self._recording.log(f"{base_path}/quality/stiction_evidence", rr.Scalars([1.0 if bool(stiction_evidence) else 0.0]))
+        self._log_text(
+            f"{base_path}/state",
+            "\n".join(
+                [
+                    f"stage={stage}",
+                    f"phase_name={phase_name}",
+                    f"group_index={int(group_index)}",
+                    f"round_index={int(round_index)}",
+                    f"active_motor_id={int(active_motor_id)}",
+                    f"motor_id={int(motor_id)}",
+                    str(safety_margin_text),
+                ]
+            ),
+        )
+        self._recording.log(
+            f"{base_path}/events",
+            rr.TextLog(f"{stage}: {phase_name} group={int(group_index)} round={int(round_index)}"),
         )
 
     def log_phase_event(self, *, motor_id: int, phase_name: str, detail: str = "") -> None:
         if self._recording is None:
             return
+        self._recording.log(
+            f"live/motors/motor_{int(motor_id):02d}/events",
+            rr.TextLog(f"{phase_name}: {detail}".strip()),
+        )
         self._recording.log(
             f"live/events/motor_{int(motor_id):02d}",
             rr.TextLog(f"{phase_name}: {detail}".strip()),

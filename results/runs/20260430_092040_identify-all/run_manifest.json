@@ -1,0 +1,15 @@
+{
+  "run_label": "20260430_092040_identify-all",
+  "mode": "identify-all",
+  "start_time": "2026-04-30T01:20:40+00:00",
+  "end_time": null,
+  "repeat_count": 3,
+  "motor_order": [
+    3
+  ],
+  "capture_files": [],
+  "identification_files": [],
+  "summary_files": {},
+  "rerun_recording_path": "/home/luwen/桌面/参数_usb2fdcan/results/runs/20260430_092040_identify-all/identify-all.rrd",
+  "config_path": "/home/luwen/桌面/参数_usb2fdcan/friction_identification_core/default.yaml"
+}

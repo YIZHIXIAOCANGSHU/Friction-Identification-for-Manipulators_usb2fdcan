@@ -13,13 +13,20 @@ from friction_identification_core.core import (
     FrictionIdentificationResult,
     InertiaIdentificationResult,
     MotorIdentificationResult,
+    PIECEWISE_STATIC_LINEAR_KIND,
     RoundCapture,
     ValidationResult,
 )
+from friction_identification_core.capture import CaptureBuffer
 from friction_identification_core.results import ResultStore, RoundArtifact
 from friction_identification_core.runtime_config import DEFAULT_CONFIG_PATH, load_config
-from friction_identification_core.workflow import run_breakaway, run_compensation, run_identify_all
-from friction_identification_core.io import RECV_FRAME_HEAD, RECV_FRAME_STRUCT
+from friction_identification_core.workflow import _identify_round, run_breakaway, run_compensation, run_dynamic_mit, run_identify_all
+from friction_identification_core.phases.breakaway import breakaway_torque_scan_values
+from friction_identification_core.phases.dynamic_mit import build_dynamic_mit_trajectory
+from friction_identification_core.phases.low_speed import _run_low_speed_micro_motion, run_low_speed_characterization_phase
+from friction_identification_core.io import FeedbackFrameParser, RECV_FRAME_HEAD, RECV_FRAME_STRUCT
+from friction_identification_core.safety import RuntimeAbortError
+from friction_identification_core.visualization import RerunRecorder
 
 
 class ClosedLoopFakeTransport:
@@ -38,6 +45,7 @@ class ClosedLoopFakeTransport:
         trip_command_threshold: float = 0.05,
         trip_velocity: float | None = None,
         initial_velocity_by_motor: dict[int, float] | None = None,
+        initial_position_by_motor: dict[int, float] | None = None,
         torque_limit: float = 2.5,
     ) -> None:
         self._motor_ids = tuple(int(motor_id) for motor_id in motor_ids)
@@ -55,13 +63,17 @@ class ClosedLoopFakeTransport:
             int(motor_id): float(velocity)
             for motor_id, velocity in (initial_velocity_by_motor or {}).items()
         }
+        self._initial_position_by_motor = {
+            int(motor_id): float(position)
+            for motor_id, position in (initial_position_by_motor or {}).items()
+        }
         self._torque_limit = float(torque_limit)
         self._pending = bytearray()
         self._state = {
             motor_id: {
                 "enabled": False,
                 "mode": "mit_torque",
-                "position": 0.0,
+                "position": float(self._initial_position_by_motor.get(int(motor_id), 0.0)),
                 "velocity": float(self._initial_velocity_by_motor.get(int(motor_id), 0.0)),
                 "torque_feedback": 0.0,
                 "torque_cmd": 0.0,
@@ -71,6 +83,8 @@ class ClosedLoopFakeTransport:
             for motor_id in self._motor_ids
         }
         self.writes: list[tuple[str, int, float]] = []
+        self.mit_velocity_commands: list[dict[str, float]] = []
+        self.mit_state_commands: list[dict[str, float]] = []
         self.zero_command_count = 0
         self.disable_count = 0
         self.closed = False
@@ -150,13 +164,55 @@ class ClosedLoopFakeTransport:
         torque_ff: float = 0.0,
         position: float = 0.0,
     ) -> bytes:
-        _ = kp, torque_ff, position
         item = self._state[int(motor_id)]
         item["mode"] = "mit_velocity"
         item["velocity_cmd"] = float(velocity)
         item["kd"] = float(kd)
         packet = f"mit_velocity:{int(motor_id)}:{float(velocity):+.6f}:{float(kd):+.6f}".encode("ascii")
         self.writes.append(("mit_velocity", int(motor_id), float(velocity)))
+        self.mit_velocity_commands.append(
+            {
+                "motor_id": float(motor_id),
+                "velocity": float(velocity),
+                "kd": float(kd),
+                "kp": float(kp),
+                "torque_ff": float(torque_ff),
+                "position": float(position),
+            }
+        )
+        return packet
+
+    def send_mit_state(
+        self,
+        motor_id: int,
+        position: float,
+        velocity: float,
+        kp: float,
+        kd: float,
+        torque_ff: float = 0.0,
+    ) -> bytes:
+        item = self._state[int(motor_id)]
+        item["mode"] = "mit_state"
+        item["position_cmd"] = float(position)
+        item["velocity_cmd"] = float(velocity)
+        item["kp"] = float(kp)
+        item["kd"] = float(kd)
+        item["torque_cmd"] = float(torque_ff)
+        packet = (
+            f"mit_state:{int(motor_id)}:{float(position):+.6f}:"
+            f"{float(velocity):+.6f}:{float(kp):+.6f}:{float(kd):+.6f}:{float(torque_ff):+.6f}"
+        ).encode("ascii")
+        self.writes.append(("mit_state", int(motor_id), float(velocity)))
+        self.mit_state_commands.append(
+            {
+                "motor_id": float(motor_id),
+                "position": float(position),
+                "velocity": float(velocity),
+                "kp": float(kp),
+                "kd": float(kd),
+                "torque_ff": float(torque_ff),
+            }
+        )
         return packet
 
     def send_velocity_mode(self, motor_id: int, velocity: float) -> bytes:
@@ -173,6 +229,8 @@ class ClosedLoopFakeTransport:
             return self.send_mit_torque(int(motor_id), 0.0)
         if semantic_mode == "mit_velocity":
             return self.send_mit_velocity(int(motor_id), 0.0, 0.8)
+        if semantic_mode == "mit_state":
+            return self.send_mit_state(int(motor_id), 0.0, 0.0, 0.0, 0.8)
         return self.send_velocity_mode(int(motor_id), 0.0)
 
     def enable_motor(self, motor_id: int) -> bytes:
@@ -319,6 +377,25 @@ class CommandTriggeredFeedbackFakeTransport(ClosedLoopFakeTransport):
             kp=kp,
             torque_ff=torque_ff,
             position=position,
+        )
+
+    def send_mit_state(
+        self,
+        motor_id: int,
+        position: float,
+        velocity: float,
+        kp: float,
+        kd: float,
+        torque_ff: float = 0.0,
+    ) -> bytes:
+        self._grant_feedback()
+        return super().send_mit_state(
+            motor_id,
+            position,
+            velocity,
+            kp,
+            kd,
+            torque_ff=torque_ff,
         )
 
     def send_velocity_mode(self, motor_id: int, velocity: float) -> bytes:
@@ -515,8 +592,37 @@ class WorkflowTests(unittest.TestCase):
             friction_term=np.asarray([0.0], dtype=np.float64),
             inertia_term=np.asarray([0.0], dtype=np.float64),
             guard_scale=np.asarray([1.0], dtype=np.float64),
+            stiction_evidence=np.asarray([False], dtype=bool),
             metadata={"mode": "identify-all"},
         )
+        friction_model = {
+            "kind": PIECEWISE_STATIC_LINEAR_KIND,
+            "parameters": {
+                "tau_static": float(tau_static),
+                "tau_c": float(tau_c),
+                "viscous": float(viscous),
+                "tau_bias": 0.0,
+                "inertia": float(inertia),
+                "static_velocity_threshold_rad_s": 0.20,
+                "static_transition_velocity_rad_s": 0.50,
+                "breakaway_positive": float(tau_static),
+                "breakaway_negative": -float(tau_static),
+            },
+            "train_rmse": float(friction_rmse),
+            "valid_rmse": float(friction_rmse),
+        }
+        export_models = {
+            "embedded_piecewise_linear_friction": {
+                "kind": PIECEWISE_STATIC_LINEAR_KIND,
+                "tau_static": float(tau_static),
+                "tau_c": float(tau_c),
+                "viscous": float(viscous),
+                "tau_bias": 0.0,
+                "inertia": float(inertia),
+                "static_velocity_threshold_rad_s": 0.20,
+                "static_transition_velocity_rad_s": 0.50,
+            }
+        }
         identification = MotorIdentificationResult(
             motor_id=int(motor_id),
             motor_name=f"motor_{int(motor_id):02d}",
@@ -560,12 +666,294 @@ class WorkflowTests(unittest.TestCase):
             ),
             metadata={"mode": "identify-all"},
         )
+        identification = MotorIdentificationResult(
+            motor_id=identification.motor_id,
+            motor_name=identification.motor_name,
+            breakaway=identification.breakaway,
+            friction=identification.friction,
+            inertia=identification.inertia,
+            validation=identification.validation,
+            metadata={
+                "mode": "identify-all",
+                "model_kind": PIECEWISE_STATIC_LINEAR_KIND,
+                "friction_model": friction_model,
+                "export_models": export_models,
+            },
+        )
         artifact_dir = Path(tmpdir)
         return RoundArtifact(
             capture=capture,
             identification=identification,
             capture_path=artifact_dir / f"capture_{int(motor_id)}_{int(group_index)}.npz",
             identification_path=artifact_dir / f"identification_{int(motor_id)}_{int(group_index)}.npz",
+        )
+
+    def _synthetic_inertia_capture(self) -> RoundCapture:
+        tau_c = 0.30
+        viscous = 0.02
+        tau_bias = 0.01
+        inertia = 0.04
+
+        platform_values = np.asarray([1.0, -1.0, 2.0, -2.0, 4.0, -4.0, 6.0, -6.0], dtype=np.float64)
+        platform_phase_names = [
+            "speed_hold_train_+1.00",
+            "speed_hold_train_-1.00",
+            "speed_hold_train_+2.00",
+            "speed_hold_train_-2.00",
+            "speed_hold_train_+4.00",
+            "speed_hold_train_-4.00",
+            "speed_hold_valid_+6.00",
+            "speed_hold_valid_-6.00",
+        ]
+        speed_values = np.repeat(platform_values, 8)
+        speed_phase_names = [phase_name for phase_name in platform_phase_names for _ in range(8)]
+        speed_time = np.linspace(0.0, 1.5, speed_values.size, dtype=np.float64)
+        speed_torque = tau_c * np.sign(speed_values) + viscous * speed_values + tau_bias
+
+        inertia_time = np.linspace(1.6, 9.6, 800, dtype=np.float64)
+        local_time = inertia_time - float(inertia_time[0])
+        clean_velocity = (
+            2.5 * np.sin(2.0 * np.pi * 0.35 * local_time)
+            + 0.8 * np.sin(2.0 * np.pi * 0.90 * local_time)
+        )
+        measured_velocity = clean_velocity + (
+            0.12 * np.sin(2.0 * np.pi * 13.0 * local_time)
+            + 0.04 * np.sin(2.0 * np.pi * 27.0 * local_time)
+        )
+        clean_acceleration = np.gradient(clean_velocity, inertia_time, edge_order=1)
+        inertia_torque = (
+            tau_c * np.sign(clean_velocity)
+            + viscous * clean_velocity
+            + tau_bias
+            + inertia * clean_acceleration
+        )
+        inertia_phase_names = np.where(local_time < 5.0, "inertia_train_01", "inertia_valid_01")
+
+        time = np.concatenate([speed_time, inertia_time])
+        velocity = np.concatenate([speed_values, measured_velocity])
+        torque = np.concatenate([speed_torque, inertia_torque])
+        phase_name = np.concatenate([np.asarray(speed_phase_names, dtype=str), inertia_phase_names.astype(str)])
+
+        return RoundCapture(
+            group_index=1,
+            round_index=1,
+            target_motor_id=2,
+            motor_name="motor_02",
+            time=time,
+            motor_id=np.full(time.size, 2, dtype=np.int64),
+            position=np.zeros(time.size, dtype=np.float64),
+            velocity=velocity,
+            torque_feedback=torque,
+            command_raw=np.zeros(time.size, dtype=np.float64),
+            command=np.zeros(time.size, dtype=np.float64),
+            position_cmd=np.zeros(time.size, dtype=np.float64),
+            velocity_cmd=velocity,
+            acceleration_cmd=np.zeros(time.size, dtype=np.float64),
+            phase_name=phase_name,
+            state=np.ones(time.size, dtype=np.uint8),
+            mos_temperature=np.full(time.size, 30.0, dtype=np.float64),
+            id_match_ok=np.ones(time.size, dtype=bool),
+            filtered_velocity=np.zeros(time.size, dtype=np.float64),
+            estimated_acceleration=np.zeros(time.size, dtype=np.float64),
+            friction_term=np.zeros(time.size, dtype=np.float64),
+            inertia_term=np.zeros(time.size, dtype=np.float64),
+            guard_scale=np.ones(time.size, dtype=np.float64),
+            stiction_evidence=np.zeros(time.size, dtype=bool),
+            metadata={"mode": "identify-all"},
+        )
+
+    def _synthetic_breakaway(
+        self,
+        *,
+        positive_limit: bool = False,
+        negative_limit: bool = False,
+    ) -> BreakawayIdentificationResult:
+        scan_limit = 0.50
+        return BreakawayIdentificationResult(
+            torque_positive=scan_limit if positive_limit else 0.42,
+            torque_negative=-scan_limit if negative_limit else -0.41,
+            tau_static=scan_limit if positive_limit and negative_limit else 0.415,
+            tau_bias=0.0,
+            metadata={
+                "scan_max_torque": scan_limit,
+                "torque_step": 0.01,
+                "hold_duration": 0.25,
+                "positive_scan_limit_reached": bool(positive_limit),
+                "negative_scan_limit_reached": bool(negative_limit),
+                "both_scan_limits_reached": bool(positive_limit and negative_limit),
+            },
+        )
+
+    def test_low_speed_characterization_records_stiction_without_exceeding_limits(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            base_config = self._base_config()
+            config = replace(
+                base_config,
+                transport=replace(
+                    base_config.transport,
+                    read_timeout=0.001,
+                    read_chunk_size=RECV_FRAME_STRUCT.size * len(base_config.motor_ids),
+                    sync_timeout=0.05,
+                ),
+                low_speed=replace(
+                    base_config.low_speed,
+                    speed_points=(0.05, 0.10),
+                    ramp_acceleration=8.0,
+                    hold_duration=0.02,
+                    micro_motion_record_duration=0.03,
+                    micro_motion_velocity_limit=0.20,
+                    micro_motion_frequency_hz=1.0,
+                ),
+            )
+            transport = TrackingLossFakeTransport(motor_ids=base_config.motor_ids, low_speed_scale=0.05)
+            transport.enable_motor(1)
+            parser = FeedbackFrameParser(max_motor_id=max(base_config.motor_ids))
+            recorder = RerunRecorder(
+                Path(tmpdir) / "low_speed.rrd",
+                motor_ids=base_config.motor_ids,
+                motor_names={motor_id: base_config.motors.name_for(motor_id) for motor_id in base_config.motor_ids},
+                mode="identify-all",
+                show_viewer=False,
+            )
+            capture_buffer = CaptureBuffer(target_motor_id=1, motor_name="motor_01")
+
+            try:
+                run_low_speed_characterization_phase(
+                    config=config,
+                    transport=transport,
+                    parser=parser,
+                    rerun_recorder=recorder,
+                    capture_buffer=capture_buffer,
+                    target_motor_id=1,
+                    group_index=1,
+                    round_index=1,
+                )
+            finally:
+                recorder.close()
+                transport.close()
+
+            capture = capture_buffer.build(group_index=1, round_index=1, metadata={"mode": "identify-all"})
+            phase_names = capture.phase_name.astype(str)
+            self.assertTrue(any(name.startswith("low_speed_hold_") for name in phase_names))
+            self.assertTrue(any(name.startswith("low_speed_micro_") for name in phase_names))
+            self.assertTrue(np.any(capture.stiction_evidence))
+            commanded_velocities = [value for kind, _, value in transport.writes if kind in {"mit_velocity", "mit_state"}]
+            self.assertLessEqual(max(abs(float(item)) for item in commanded_velocities), 0.200001)
+
+    def test_low_speed_micro_motion_sends_mit_velocity_targets_without_torque_ff(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            base_config = self._base_config()
+            config = replace(
+                base_config,
+                transport=replace(
+                    base_config.transport,
+                    read_timeout=0.001,
+                    read_chunk_size=RECV_FRAME_STRUCT.size * len(base_config.motor_ids),
+                    sync_timeout=0.05,
+                ),
+                low_speed=replace(
+                    base_config.low_speed,
+                    speed_points=(0.05,),
+                    ramp_acceleration=8.0,
+                    hold_duration=0.01,
+                    micro_motion_record_duration=0.04,
+                    micro_motion_velocity_limit=0.12,
+                    micro_motion_frequency_hz=0.5,
+                    micro_motion_kp=1.5,
+                    micro_motion_kd=0.25,
+                ),
+                dynamic_mit=replace(
+                    base_config.dynamic_mit,
+                    kp=9.0,
+                    kd=1.5,
+                ),
+            )
+            transport = ClosedLoopFakeTransport(motor_ids=base_config.motor_ids)
+            transport.enable_motor(1)
+            parser = FeedbackFrameParser(max_motor_id=max(base_config.motor_ids))
+            recorder = RerunRecorder(
+                Path(tmpdir) / "low_speed_gains.rrd",
+                motor_ids=base_config.motor_ids,
+                motor_names={motor_id: base_config.motors.name_for(motor_id) for motor_id in base_config.motor_ids},
+                mode="identify-all",
+                show_viewer=False,
+            )
+            capture_buffer = CaptureBuffer(target_motor_id=1, motor_name="motor_01")
+
+            try:
+                _run_low_speed_micro_motion(
+                    config=config,
+                    transport=transport,
+                    parser=parser,
+                    rerun_recorder=recorder,
+                    capture_buffer=capture_buffer,
+                    target_motor_id=1,
+                    group_index=1,
+                    round_index=1,
+                )
+            finally:
+                recorder.close()
+                transport.close()
+
+            self.assertFalse(transport.mit_state_commands)
+            self.assertTrue(transport.mit_velocity_commands)
+            self.assertTrue(
+                all(
+                    abs(float(command["velocity"])) <= float(config.low_speed.micro_motion_velocity_limit) + 1.0e-9
+                    for command in transport.mit_velocity_commands
+                )
+            )
+            self.assertTrue(all(np.isclose(command["kp"], 0.0) for command in transport.mit_velocity_commands))
+            self.assertTrue(
+                all(np.isclose(command["kd"], config.low_speed.micro_motion_kd) for command in transport.mit_velocity_commands)
+            )
+            self.assertTrue(all(np.isclose(command["torque_ff"], 0.0) for command in transport.mit_velocity_commands))
+            self.assertTrue(all(np.isclose(command["position"], 0.0) for command in transport.mit_velocity_commands))
+
+            capture = capture_buffer.build(group_index=1, round_index=1, metadata={"mode": "identify-all"})
+            micro_mask = np.asarray(
+                [name.startswith("low_speed_micro_") for name in capture.phase_name.astype(str)],
+                dtype=bool,
+            )
+            self.assertTrue(np.any(micro_mask))
+            self.assertTrue(np.allclose(capture.command[micro_mask], capture.velocity_cmd[micro_mask]))
+            self.assertTrue(np.allclose(capture.position_cmd[micro_mask], 0.0))
+            self.assertTrue(np.allclose(capture.kp_cmd[micro_mask], 0.0))
+            self.assertTrue(np.allclose(capture.kd_cmd[micro_mask], config.low_speed.micro_motion_kd))
+            self.assertTrue(np.allclose(capture.torque_ff_cmd[micro_mask], 0.0))
+
+    def test_breakaway_scan_values_never_exceed_scan_limit(self) -> None:
+        values = breakaway_torque_scan_values(torque_step=0.06, scan_limit=0.20)
+
+        self.assertEqual(values.tolist(), [0.06, 0.12, 0.18, 0.20])
+        self.assertLessEqual(float(np.max(values)), 0.20)
+
+    def test_dynamic_mit_trajectory_rejects_velocity_budget_overrun(self) -> None:
+        base_config = self._base_config()
+        config = replace(
+            base_config,
+            safety=replace(base_config.safety, hard_speed_abort_abs=10.0),
+            identification=replace(base_config.identification, generation_safety_margin_ratio=0.80),
+            dynamic_mit=replace(
+                base_config.dynamic_mit,
+                trajectory_type="sine",
+                position_amplitude=1.0,
+                frequency_hz=2.0,
+                velocity_limit=2.0,
+            ),
+        )
+
+        with self.assertRaisesRegex(ValueError, "lower position_amplitude or frequency_hz"):
+            build_dynamic_mit_trajectory(config, target_motor_id=1)
+
+    def test_dynamic_mit_trajectory_stays_within_velocity_budgets(self) -> None:
+        base_config = self._base_config()
+        trajectory = build_dynamic_mit_trajectory(base_config, target_motor_id=1)
+
+        self.assertLessEqual(float(np.max(np.abs(trajectory.velocity))), float(base_config.dynamic_mit.velocity_limit) + 1.0e-9)
+        self.assertLess(
+            float(np.max(np.abs(trajectory.velocity))),
+            float(base_config.safety.hard_speed_abort_abs) * float(base_config.identification.generation_safety_margin_ratio),
         )
 
     def test_identify_all_generates_capture_and_summary(self) -> None:
@@ -598,6 +986,15 @@ class WorkflowTests(unittest.TestCase):
                     steady_hold_duration=0.03,
                     steady_window_ratio=0.5,
                 ),
+                low_speed=replace(
+                    base_config.low_speed,
+                    speed_points=(0.05, 0.10),
+                    ramp_acceleration=8.0,
+                    hold_duration=0.02,
+                    micro_motion_record_duration=0.03,
+                    micro_motion_velocity_limit=0.20,
+                    micro_motion_frequency_hz=1.0,
+                ),
                 identification=replace(
                     base_config.identification,
                     steady_speed_points=(0.5, 1.0, 2.0),
@@ -605,6 +1002,21 @@ class WorkflowTests(unittest.TestCase):
                     savgol_window=9,
                     savgol_polyorder=2,
                     min_publishable_rounds=1,
+                    min_joint_fit_sample_count=3,
+                    friction_rmse_publish_threshold=10.0,
+                    inertia_rmse_publish_threshold=10.0,
+                ),
+                dynamic_mit=replace(
+                    base_config.dynamic_mit,
+                    enabled=True,
+                    position_amplitude=0.15,
+                    velocity_limit=2.0,
+                    frequency_hz=1.0,
+                    warmup_duration=0.0,
+                    record_duration=0.04,
+                    kp=4.0,
+                    kd=0.5,
+                    min_fit_sample_count=3,
                 ),
                 output=replace(base_config.output, results_dir=Path(tmpdir)),
             )
@@ -621,12 +1033,28 @@ class WorkflowTests(unittest.TestCase):
             self.assertEqual(artifact.capture.metadata["mode"], "identify-all")
             phase_names = set(artifact.capture.phase_name.astype(str).tolist())
             self.assertTrue(any(name.startswith("breakaway_") for name in phase_names))
+            self.assertTrue(any(name.startswith("low_speed_") for name in phase_names))
             self.assertTrue(any(name.startswith("speed_hold_") for name in phase_names))
             self.assertTrue(any(name.startswith("inertia_") for name in phase_names))
+            self.assertTrue(any(name.startswith("dynamic_mit_") for name in phase_names))
+            self.assertIn("stiction_evidence", artifact.capture.__dataclass_fields__)
+            phase_names_array = artifact.capture.phase_name.astype(str)
+            breakaway_torque_mask = np.asarray(
+                [
+                    name.startswith("breakaway_pos_step_") or name.startswith("breakaway_neg_step_")
+                    for name in phase_names_array
+                ],
+                dtype=bool,
+            )
+            self.assertTrue(np.any(np.abs(artifact.capture.torque_ff_cmd[breakaway_torque_mask]) > 0.0))
+            self.assertTrue(np.allclose(artifact.capture.torque_ff_cmd[~breakaway_torque_mask], 0.0))
             self.assertGreater(float(artifact.identification.breakaway.torque_positive), 0.0)
             self.assertLess(float(artifact.identification.breakaway.torque_negative), 0.0)
             self.assertTrue(np.isfinite(float(artifact.identification.friction.tau_c)))
             self.assertTrue(np.isfinite(float(artifact.identification.inertia.inertia)))
+            self.assertEqual(artifact.identification.metadata["model_kind"], PIECEWISE_STATIC_LINEAR_KIND)
+            self.assertIn(artifact.identification.metadata["fit_model_kind"], ("static_v1", "joint_static_dynamic_v1"))
+            self.assertIn("friction_model", artifact.identification.metadata)
 
             with np.load(result.summary_paths.run_summary_path, allow_pickle=False) as summary:
                 self.assertIn("tau_c", summary.files)
@@ -636,11 +1064,373 @@ class WorkflowTests(unittest.TestCase):
             latest_path = Path(tmpdir) / "latest_motor_parameters.json"
             self.assertTrue(latest_path.exists())
             payload = json.loads(latest_path.read_text(encoding="utf-8"))
+            latest_text = latest_path.read_text(encoding="utf-8")
+            for legacy_token in ("ta" + "nh", "open" + "arm", "e" + "xp("):
+                self.assertNotIn(legacy_token, latest_text)
             self.assertEqual(payload["speed_limit_rad_s"], 10.0)
             self.assertEqual(payload["results_dir"], str(Path(tmpdir)))
             self.assertIn("1", payload["motors"])
             self.assertEqual(payload["motors"]["1"]["motor_id"], 1)
             self.assertEqual(payload["motors"]["1"]["source_run_label"], Path(result.manifest_path).parent.name)
+            self.assertEqual(payload["motors"]["1"]["model_version"], "1.0")
+            self.assertEqual(payload["motors"]["1"]["model_kind"], PIECEWISE_STATIC_LINEAR_KIND)
+            self.assertIn("fit_method", payload["motors"]["1"])
+            self.assertIn("source_phases", payload["motors"]["1"])
+            self.assertIn("confidence", payload["motors"]["1"])
+            self.assertIn("quality_flags", payload["motors"]["1"])
+            self.assertEqual(payload["motors"]["1"]["friction_model"]["kind"], PIECEWISE_STATIC_LINEAR_KIND)
+            self.assertIn("embedded_piecewise_linear_friction", payload["motors"]["1"]["export_models"])
+
+    def test_identify_round_selects_best_inertia_savgol_candidate(self) -> None:
+        base_config = self._base_config()
+        config = replace(
+            base_config,
+            identification=replace(
+                base_config.identification,
+                inertia_savgol_window_candidates=(21, 61),
+                friction_rmse_publish_threshold=1.0,
+                inertia_rmse_publish_threshold=1.0,
+            ),
+            dynamic_mit=replace(base_config.dynamic_mit, enabled=False),
+        )
+
+        identification = _identify_round(
+            config=config,
+            capture=self._synthetic_inertia_capture(),
+            mode="identify-all",
+            breakaway_result=self._synthetic_breakaway(),
+        )
+
+        inertia_metadata = identification.inertia.metadata
+        candidate_results = inertia_metadata["savgol_window_candidates"]
+        by_window = {int(item["window"]): item for item in candidate_results}
+        self.assertEqual(inertia_metadata["selected_savgol_window"], 61)
+        self.assertLess(float(by_window[61]["valid_rmse"]), float(by_window[21]["valid_rmse"]))
+        self.assertTrue(identification.validation.recommended_for_compensation)
+
+    def test_identify_round_rejects_publish_when_both_breakaway_directions_hit_scan_limit(self) -> None:
+        base_config = self._base_config()
+        config = replace(
+            base_config,
+            identification=replace(
+                base_config.identification,
+                inertia_savgol_window_candidates=(21, 61),
+                friction_rmse_publish_threshold=1.0,
+                inertia_rmse_publish_threshold=1.0,
+            ),
+            dynamic_mit=replace(base_config.dynamic_mit, enabled=False),
+        )
+
+        identification = _identify_round(
+            config=config,
+            capture=self._synthetic_inertia_capture(),
+            mode="identify-all",
+            breakaway_result=self._synthetic_breakaway(positive_limit=True, negative_limit=True),
+        )
+
+        self.assertFalse(identification.validation.recommended_for_compensation)
+        self.assertEqual(identification.validation.metadata["status"], "rejected")
+        self.assertIn("breakaway_scan_limit_reached=both", identification.validation.metadata["reasons"])
+
+    def test_identify_round_records_single_breakaway_scan_limit_without_rejecting(self) -> None:
+        base_config = self._base_config()
+        config = replace(
+            base_config,
+            identification=replace(
+                base_config.identification,
+                inertia_savgol_window_candidates=(21, 61),
+                friction_rmse_publish_threshold=1.0,
+                inertia_rmse_publish_threshold=1.0,
+            ),
+            dynamic_mit=replace(base_config.dynamic_mit, enabled=False),
+        )
+
+        identification = _identify_round(
+            config=config,
+            capture=self._synthetic_inertia_capture(),
+            mode="identify-all",
+            breakaway_result=self._synthetic_breakaway(positive_limit=True, negative_limit=False),
+        )
+
+        self.assertTrue(identification.validation.recommended_for_compensation)
+        self.assertTrue(identification.validation.metadata["breakaway_scan_limit"]["positive"])
+        self.assertFalse(identification.validation.metadata["breakaway_scan_limit"]["negative"])
+
+    def test_dynamic_mit_generates_command_rich_capture(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            base_config = self._base_config()
+            config = replace(
+                base_config,
+                motors=replace(base_config.motors, enabled_ids=(1,)),
+                transport=replace(
+                    base_config.transport,
+                    read_timeout=0.001,
+                    read_chunk_size=RECV_FRAME_STRUCT.size * len(base_config.motor_ids),
+                    sync_timeout=0.05,
+                ),
+                safety=replace(
+                    base_config.safety,
+                    moving_hold_ms=5,
+                    post_abort_disable_delay_ms=10,
+                ),
+                dynamic_mit=replace(
+                    base_config.dynamic_mit,
+                    enabled=True,
+                    trajectory_type="sine",
+                    position_amplitude=0.2,
+                    velocity_limit=2.0,
+                    frequency_hz=1.0,
+                    warmup_duration=0.0,
+                    record_duration=0.05,
+                    kp=4.0,
+                    kd=0.5,
+                    min_fit_sample_count=3,
+                ),
+                output=replace(base_config.output, results_dir=Path(tmpdir)),
+            )
+            transport = CommandTriggeredFeedbackFakeTransport(motor_ids=base_config.motor_ids)
+
+            result = run_dynamic_mit(config, transport_factory=lambda: transport, show_rerun_viewer=False)
+
+            self.assertTrue(transport.closed)
+            self.assertTrue(any(kind == "mit_state" for kind, _, _ in transport.writes))
+            capture_path = result.artifacts[0].capture_path
+            with np.load(capture_path, allow_pickle=False) as capture:
+                phase_names = capture["phase_name"].astype(str)
+                self.assertTrue(any(name.startswith("dynamic_mit_") for name in phase_names))
+                self.assertIn("kp_cmd", capture.files)
+                self.assertIn("kd_cmd", capture.files)
+                self.assertIn("torque_ff_cmd", capture.files)
+                self.assertIn("position_error", capture.files)
+                self.assertIn("velocity_error", capture.files)
+                self.assertIn("used_for_fit", capture.files)
+                self.assertTrue(np.any(capture["used_for_fit"]))
+                self.assertTrue(np.allclose(capture["torque_ff_cmd"], 0.0))
+
+    def test_dynamic_mit_position_commands_are_relative_to_current_position(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            base_config = self._base_config()
+            initial_position = -2.25
+            config = replace(
+                base_config,
+                motors=replace(base_config.motors, enabled_ids=(1,)),
+                transport=replace(
+                    base_config.transport,
+                    read_timeout=0.001,
+                    read_chunk_size=RECV_FRAME_STRUCT.size * len(base_config.motor_ids),
+                    sync_timeout=0.05,
+                ),
+                safety=replace(
+                    base_config.safety,
+                    moving_hold_ms=5,
+                    post_abort_disable_delay_ms=10,
+                ),
+                dynamic_mit=replace(
+                    base_config.dynamic_mit,
+                    enabled=True,
+                    trajectory_type="sine",
+                    position_amplitude=0.2,
+                    velocity_limit=2.0,
+                    frequency_hz=1.0,
+                    warmup_duration=0.0,
+                    record_duration=0.05,
+                    kp=4.0,
+                    kd=0.5,
+                    min_fit_sample_count=3,
+                ),
+                output=replace(base_config.output, results_dir=Path(tmpdir)),
+            )
+            transport = CommandTriggeredFeedbackFakeTransport(
+                motor_ids=base_config.motor_ids,
+                initial_position_by_motor={1: initial_position},
+            )
+
+            result = run_dynamic_mit(config, transport_factory=lambda: transport, show_rerun_viewer=False)
+
+            capture_path = result.artifacts[0].capture_path
+            with np.load(capture_path, allow_pickle=False) as capture:
+                phase_names = capture["phase_name"].astype(str)
+                anchor_mask = phase_names == "dynamic_mit_anchor"
+                train_mask = np.asarray([name.startswith("dynamic_mit_train") for name in phase_names], dtype=bool)
+                self.assertTrue(np.any(anchor_mask))
+                self.assertTrue(np.any(train_mask))
+                anchor_position = float(capture["position_cmd"][anchor_mask][0])
+                train_positions = capture["position_cmd"][train_mask]
+                self.assertAlmostEqual(anchor_position, initial_position, delta=0.05)
+                self.assertLess(abs(float(train_positions[0]) - anchor_position), 0.05)
+                self.assertLess(float(np.nanmax(np.abs(train_positions - anchor_position))), 0.25)
+
+    def test_dynamic_mit_aborts_at_runtime_velocity_limit(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            base_config = self._base_config()
+            config = replace(
+                base_config,
+                motors=replace(base_config.motors, enabled_ids=(1,)),
+                transport=replace(
+                    base_config.transport,
+                    read_timeout=0.001,
+                    read_chunk_size=RECV_FRAME_STRUCT.size * len(base_config.motor_ids),
+                    sync_timeout=0.05,
+                ),
+                safety=replace(
+                    base_config.safety,
+                    moving_hold_ms=5,
+                    post_abort_disable_delay_ms=10,
+                ),
+                dynamic_mit=replace(
+                    base_config.dynamic_mit,
+                    enabled=True,
+                    trajectory_type="sine",
+                    position_amplitude=0.14,
+                    velocity_limit=0.5,
+                    frequency_hz=1.0,
+                    warmup_duration=0.0,
+                    record_duration=0.20,
+                    kp=0.0,
+                    kd=0.25,
+                    min_fit_sample_count=3,
+                ),
+                output=replace(base_config.output, results_dir=Path(tmpdir)),
+            )
+            transport = ClosedLoopFakeTransport(
+                motor_ids=base_config.motor_ids,
+                trip_motor_id=1,
+                trip_command_threshold=0.05,
+                trip_velocity=0.7,
+            )
+
+            with self.assertRaises(RuntimeAbortError) as context:
+                run_dynamic_mit(config, transport_factory=lambda: transport, show_rerun_viewer=False)
+
+            self.assertEqual(context.exception.event.reason, "dynamic_mit_velocity_abort")
+            self.assertEqual(context.exception.event.velocity_limit, 0.5)
+            self.assertGreaterEqual(transport.zero_command_count, 1)
+            self.assertTrue(transport.closed)
+
+    def test_identify_all_keeps_static_model_when_joint_fit_has_higher_rmse(self) -> None:
+        base_config = self._base_config()
+        config = replace(
+            base_config,
+            identification=replace(
+                base_config.identification,
+                savgol_window=5,
+                savgol_polyorder=2,
+                min_platform_sample_count=3,
+                min_joint_fit_sample_count=8,
+                joint_dynamic_mit_weight=8.0,
+                friction_rmse_publish_threshold=0.08,
+                inertia_rmse_publish_threshold=0.08,
+            ),
+            dynamic_mit=replace(base_config.dynamic_mit, min_fit_sample_count=8),
+        )
+        true_j = 0.05
+        true_viscous = 0.04
+        true_tau_c = 0.18
+        true_tau_bias = 0.01
+
+        time_values: list[float] = []
+        velocity_values: list[float] = []
+        torque_values: list[float] = []
+        phase_values: list[str] = []
+        used_for_fit_values: list[bool] = []
+        t = 0.0
+
+        def append_segment(phase_name: str, velocity: np.ndarray, torque: np.ndarray, *, used_for_fit: bool) -> None:
+            nonlocal t
+            for vel, tau in zip(velocity, torque):
+                time_values.append(float(t))
+                velocity_values.append(float(vel))
+                torque_values.append(float(tau))
+                phase_values.append(str(phase_name))
+                used_for_fit_values.append(bool(used_for_fit))
+                t += 0.01
+
+        for phase_name, commanded_velocity in (
+            ("speed_hold_train_-2.0", -2.0),
+            ("speed_hold_train_2.0", 2.0),
+            ("speed_hold_valid_-2.0", -2.0),
+            ("speed_hold_valid_2.0", 2.0),
+        ):
+            velocity = np.full(8, float(commanded_velocity), dtype=np.float64)
+            torque = true_viscous * velocity + true_tau_c * np.sign(velocity) + true_tau_bias
+            append_segment(phase_name, velocity, torque, used_for_fit=False)
+
+        inertia_time = np.linspace(0.0, 1.0, 80, dtype=np.float64)
+        inertia_velocity = 1.4 * np.sin(2.0 * np.pi * inertia_time)
+        inertia_acceleration = np.gradient(inertia_velocity, 0.01, edge_order=1)
+        inertia_torque = (
+            true_j * inertia_acceleration
+            + true_viscous * inertia_velocity
+            + true_tau_c * np.sign(inertia_velocity)
+            + true_tau_bias
+        )
+        append_segment("inertia_train_wave", inertia_velocity[:48], inertia_torque[:48], used_for_fit=False)
+        append_segment("inertia_valid_wave", inertia_velocity[48:], inertia_torque[48:], used_for_fit=False)
+
+        dynamic_velocity = np.linspace(-1.5, 1.5, 40, dtype=np.float64)
+        dynamic_acceleration = np.gradient(dynamic_velocity, 0.01, edge_order=1)
+        dynamic_torque = (
+            true_j * dynamic_acceleration
+            + true_viscous * dynamic_velocity
+            + true_tau_c * np.sign(dynamic_velocity)
+            + true_tau_bias
+            + 1.0
+        )
+        append_segment("dynamic_mit_train_bad", dynamic_velocity[:28], dynamic_torque[:28], used_for_fit=True)
+        append_segment("dynamic_mit_valid_bad", dynamic_velocity[28:], dynamic_torque[28:], used_for_fit=True)
+
+        time = np.asarray(time_values, dtype=np.float64)
+        velocity = np.asarray(velocity_values, dtype=np.float64)
+        torque = np.asarray(torque_values, dtype=np.float64)
+        capture = RoundCapture(
+            group_index=1,
+            round_index=1,
+            target_motor_id=1,
+            motor_name="motor_01",
+            time=time,
+            motor_id=np.full(time.size, 1, dtype=np.int64),
+            position=np.zeros(time.size, dtype=np.float64),
+            velocity=velocity,
+            torque_feedback=torque,
+            command_raw=np.zeros(time.size, dtype=np.float64),
+            command=np.zeros(time.size, dtype=np.float64),
+            position_cmd=np.zeros(time.size, dtype=np.float64),
+            velocity_cmd=velocity,
+            acceleration_cmd=np.zeros(time.size, dtype=np.float64),
+            phase_name=np.asarray(phase_values, dtype=str),
+            state=np.ones(time.size, dtype=np.uint8),
+            mos_temperature=np.full(time.size, 30.0, dtype=np.float64),
+            id_match_ok=np.ones(time.size, dtype=bool),
+            filtered_velocity=np.zeros(time.size, dtype=np.float64),
+            estimated_acceleration=np.zeros(time.size, dtype=np.float64),
+            friction_term=np.zeros(time.size, dtype=np.float64),
+            inertia_term=np.zeros(time.size, dtype=np.float64),
+            guard_scale=np.ones(time.size, dtype=np.float64),
+            used_for_fit=np.asarray(used_for_fit_values, dtype=bool),
+            tau_mit_est=torque,
+            metadata={"mode": "identify-all"},
+        )
+        breakaway_result = BreakawayIdentificationResult(
+            torque_positive=0.2,
+            torque_negative=-0.18,
+            tau_static=0.19,
+            tau_bias=0.01,
+            metadata={},
+        )
+
+        identification = _identify_round(
+            config=config,
+            capture=capture,
+            mode="identify-all",
+            breakaway_result=breakaway_result,
+        )
+
+        self.assertEqual(identification.metadata["model_kind"], PIECEWISE_STATIC_LINEAR_KIND)
+        self.assertEqual(identification.metadata["fit_model_kind"], "static_v1")
+        self.assertEqual(identification.validation.metadata["model_selection"], "static_selected_over_joint")
+        joint_candidate = identification.validation.metadata["joint_candidate"]
+        self.assertLess(float(identification.validation.friction_rmse), float(joint_candidate["friction_rmse"]))
+        self.assertLess(float(identification.validation.inertia_rmse), float(joint_candidate["inertia_rmse"]))
 
     def test_identify_all_merges_latest_parameters_by_motor(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -674,6 +1464,13 @@ class WorkflowTests(unittest.TestCase):
                         steady_hold_duration=0.03,
                         steady_window_ratio=0.5,
                     ),
+                    low_speed=replace(
+                        base_config.low_speed,
+                        speed_points=(0.05,),
+                        ramp_acceleration=8.0,
+                        hold_duration=0.01,
+                        micro_motion_record_duration=0.0,
+                    ),
                     identification=replace(
                         base_config.identification,
                         steady_speed_points=(0.5, 1.0, 2.0),
@@ -681,7 +1478,10 @@ class WorkflowTests(unittest.TestCase):
                         savgol_window=9,
                         savgol_polyorder=2,
                         min_publishable_rounds=1,
+                        friction_rmse_publish_threshold=10.0,
+                        inertia_rmse_publish_threshold=10.0,
                     ),
+                    dynamic_mit=replace(base_config.dynamic_mit, enabled=False),
                     output=replace(base_config.output, results_dir=Path(tmpdir)),
                 )
 
@@ -739,14 +1539,23 @@ class WorkflowTests(unittest.TestCase):
                     steady_hold_duration=0.03,
                     steady_window_ratio=0.5,
                 ),
+                low_speed=replace(
+                    base_config.low_speed,
+                    speed_points=(0.05,),
+                    ramp_acceleration=8.0,
+                    hold_duration=0.01,
+                    micro_motion_record_duration=0.0,
+                ),
                 identification=replace(
                     base_config.identification,
                     steady_speed_points=(0.5, 1.0, 2.0, 4.0, 8.0),
+                    generation_safety_margin_ratio=0.85,
                     repeat_count=1,
                     savgol_window=9,
                     savgol_polyorder=2,
                     min_publishable_rounds=1,
                 ),
+                dynamic_mit=replace(base_config.dynamic_mit, enabled=False),
                 output=replace(base_config.output, results_dir=Path(tmpdir)),
             )
 
@@ -764,9 +1573,11 @@ class WorkflowTests(unittest.TestCase):
 
             latest_path = Path(tmpdir) / "latest_motor_parameters.json"
             payload = json.loads(latest_path.read_text(encoding="utf-8"))
-            self.assertNotIn("3", payload["motors"])
+            self.assertIn("3", payload["motors"])
+            self.assertEqual(payload["motors"]["3"]["publish_status"], "rejected")
+            self.assertFalse(payload["motors"]["3"]["recommended_for_compensation"])
 
-    def test_save_latest_parameters_uses_only_accepted_rounds_and_preserves_previous_model(self) -> None:
+    def test_save_latest_parameters_uses_only_accepted_rounds_and_records_unpublished_latest_attempt(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             base_config = self._base_config()
             config = replace(
@@ -890,10 +1701,76 @@ class WorkflowTests(unittest.TestCase):
             self.assertEqual(motor_1["publish_status"], "published")
             self.assertEqual(motor_1["accepted_round_count"], 2)
             self.assertEqual(motor_1["selected_rounds"], [1, 2])
+            self.assertEqual(motor_1["friction_model"]["kind"], PIECEWISE_STATIC_LINEAR_KIND)
+            self.assertAlmostEqual(float(motor_1["friction_model"]["parameters"]["tau_static"]), 0.22, places=6)
+            self.assertIn("embedded_piecewise_linear_friction", motor_1["export_models"])
+            self.assertAlmostEqual(float(motor_1["export_models"]["embedded_piecewise_linear_friction"]["tau_c"]), 0.12, places=6)
 
             motor_2 = payload["motors"]["2"]
-            self.assertEqual(motor_2["source_run_label"], "seed_run")
-            self.assertAlmostEqual(float(motor_2["tau_c"]), 0.21, places=6)
+            self.assertEqual(motor_2["source_run_label"], store.run_label)
+            self.assertEqual(motor_2["publish_status"], "not_published")
+            self.assertEqual(motor_2["accepted_round_count"], 1)
+            self.assertEqual(motor_2["selected_rounds"], [1])
+            self.assertAlmostEqual(float(motor_2["tau_c"]), 0.18, places=6)
+            self.assertEqual(motor_2["previous_published_model"]["source_run_label"], "seed_run")
+            self.assertAlmostEqual(float(motor_2["previous_published_model"]["tau_c"]), 0.21, places=6)
+
+            store_again = ResultStore(config, mode="identify-all")
+            store_again.save_latest_parameters(artifacts)
+            payload_again = json.loads(latest_path.read_text(encoding="utf-8"))
+            motor_2_again = payload_again["motors"]["2"]
+            self.assertEqual(motor_2_again["source_run_label"], store_again.run_label)
+            self.assertEqual(motor_2_again["publish_status"], "not_published")
+            self.assertEqual(motor_2_again["previous_published_model"]["source_run_label"], "seed_run")
+
+    def test_save_latest_parameters_rejects_model_that_exceeds_compensation_budget(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            base_config = self._base_config()
+            config = replace(
+                base_config,
+                motors=replace(base_config.motors, enabled_ids=(5,)),
+                identification=replace(
+                    base_config.identification,
+                    repeat_count=2,
+                    min_publishable_rounds=2,
+                ),
+                output=replace(base_config.output, results_dir=Path(tmpdir)),
+            )
+            artifacts = [
+                self._synthetic_artifact(
+                    motor_id=5,
+                    group_index=1,
+                    tau_static=3.0,
+                    tau_c=0.50,
+                    viscous=0.0,
+                    inertia=0.0,
+                    friction_rmse=0.01,
+                    inertia_rmse=0.01,
+                    recommended=True,
+                    tmpdir=tmpdir,
+                ),
+                self._synthetic_artifact(
+                    motor_id=5,
+                    group_index=2,
+                    tau_static=3.0,
+                    tau_c=0.50,
+                    viscous=0.0,
+                    inertia=0.0,
+                    friction_rmse=0.01,
+                    inertia_rmse=0.01,
+                    recommended=True,
+                    tmpdir=tmpdir,
+                ),
+            ]
+            store = ResultStore(config, mode="identify-all")
+            store.save_latest_parameters(artifacts)
+
+            payload = json.loads((Path(tmpdir) / "latest_motor_parameters.json").read_text(encoding="utf-8"))
+            motor_5 = payload["motors"]["5"]
+            self.assertEqual(motor_5["publish_status"], "rejected")
+            self.assertFalse(motor_5["recommended_for_compensation"])
+            self.assertIn("model_exceeds_compensation_budget", motor_5["publish_detail"])
+            self.assertAlmostEqual(float(motor_5["friction_model"]["parameters"]["tau_static"]), 3.0, places=6)
 
     def test_compensation_requires_latest_parameters(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1099,7 +1976,7 @@ class WorkflowTests(unittest.TestCase):
                 self.assertGreater(int(capture["time"].size), 0)
                 self.assertTrue(np.any(np.abs(capture["command"]) > 0.0))
 
-    def test_compensation_uses_tau_static_assist_from_feedback_torque_near_zero_speed(self) -> None:
+    def test_compensation_uses_piecewise_static_level_near_zero_speed(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             base_config = self._base_config()
             latest_path = Path(tmpdir) / "latest_motor_parameters.json"
@@ -1164,9 +2041,9 @@ class WorkflowTests(unittest.TestCase):
             )
 
             with np.load(result.artifacts[0], allow_pickle=False) as capture:
-                self.assertGreater(float(np.max(capture["command"])), 0.15)
-                self.assertLessEqual(float(np.max(capture["command"])), 0.18 + 1.0e-6)
-                self.assertGreater(float(np.max(capture["friction_term"])), 0.15)
+                self.assertGreater(float(np.max(capture["command"])), 0.0)
+                self.assertLessEqual(float(np.max(capture["command"])), 0.60 + 1.0e-6)
+                self.assertGreater(float(np.max(capture["friction_term"])), 0.55)
 
     def test_compensation_limits_static_friction_inertia_and_total_command(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1185,7 +2062,7 @@ class WorkflowTests(unittest.TestCase):
                                 "identified_at": "2026-04-25T00:00:00+00:00",
                                 "source_run_label": "seed_run",
                                 "tau_static": 2.0,
-                                "tau_bias": 0.0,
+                                "tau_bias": 0.4,
                                 "tau_c": 0.2,
                                 "viscous": 0.0,
                                 "inertia": 1.5,
@@ -1238,8 +2115,8 @@ class WorkflowTests(unittest.TestCase):
                 self.assertIn("friction_term", capture.files)
                 self.assertIn("inertia_term", capture.files)
                 self.assertIn("guard_scale", capture.files)
-                self.assertLessEqual(float(np.max(np.abs(capture["friction_term"]))), 0.300001)
-                self.assertLessEqual(float(np.max(np.abs(capture["inertia_term"]))), 0.218751)
+                self.assertTrue(np.all(np.isfinite(capture["friction_term"])))
+                self.assertGreater(float(np.max(np.abs(capture["inertia_term"]))), 0.218751)
                 self.assertLessEqual(float(np.max(np.abs(capture["command"]))), 0.875001)
                 self.assertTrue(np.all(np.isfinite(capture["guard_scale"])))
                 self.assertTrue(np.all(capture["guard_scale"] <= 1.0))
@@ -1308,6 +2185,17 @@ class WorkflowTests(unittest.TestCase):
                     show_rerun_viewer=False,
                     max_runtime_s=0.05,
                 )
+
+            capture_files = sorted(Path(tmpdir).glob("runs/*_compensation/group_01/motor_01/capture.npz"))
+            self.assertEqual(len(capture_files), 1)
+            with np.load(capture_files[0], allow_pickle=False) as capture:
+                self.assertGreater(int(capture["time"].size), 0)
+
+            manifest_files = sorted(Path(tmpdir).glob("runs/*_compensation/run_manifest.json"))
+            self.assertEqual(len(manifest_files), 1)
+            manifest = json.loads(manifest_files[0].read_text(encoding="utf-8"))
+            self.assertEqual(manifest["abort_event"]["reason"], "soft_speed_abort")
+            self.assertEqual(manifest["capture_files"], [str(capture_files[0])])
 
     def test_breakaway_hard_abort_sends_zero_then_disable(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

@@ -19,7 +19,7 @@ class MainCliTests(unittest.TestCase):
     def test_parser_exposes_new_modes(self) -> None:
         parser = build_parser()
         mode_action = next(action for action in parser._actions if action.dest == "mode")
-        self.assertEqual(tuple(mode_action.choices), ("identify-all", "compensation", "breakaway", "speed-hold", "inertia"))
+        self.assertEqual(tuple(mode_action.choices), ("identify-all", "compensation", "breakaway", "speed-hold", "inertia", "dynamic-mit"))
 
     def test_main_routes_modes_to_runners(self) -> None:
         loaded_config = object()
@@ -33,18 +33,21 @@ class MainCliTests(unittest.TestCase):
             mock.patch("friction_identification_core.__main__.run_breakaway") as breakaway_mock,
             mock.patch("friction_identification_core.__main__.run_speed_hold") as speed_hold_mock,
             mock.patch("friction_identification_core.__main__.run_inertia") as inertia_mock,
+            mock.patch("friction_identification_core.__main__.run_dynamic_mit") as dynamic_mit_mock,
         ):
             main([])
             main(["--mode", "compensation"])
             main(["--mode", "breakaway"])
             main(["--mode", "speed-hold"])
             main(["--mode", "inertia"])
+            main(["--mode", "dynamic-mit"])
 
         identify_all_mock.assert_called_once_with(configured, show_rerun_viewer=True)
         compensation_mock.assert_called_once_with(configured, show_rerun_viewer=True)
         breakaway_mock.assert_called_once_with(configured, show_rerun_viewer=True)
         speed_hold_mock.assert_called_once_with(configured, show_rerun_viewer=True)
         inertia_mock.assert_called_once_with(configured, show_rerun_viewer=True)
+        dynamic_mit_mock.assert_called_once_with(configured, show_rerun_viewer=True)
 
     def test_readme_mentions_identify_all_runtime(self) -> None:
         readme = README_PATH.read_text(encoding="utf-8")

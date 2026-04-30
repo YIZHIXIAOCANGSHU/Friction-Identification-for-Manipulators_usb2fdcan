@@ -7,12 +7,13 @@ from friction_identification_core.results import log_info
 from friction_identification_core.workflow import (
     run_breakaway,
     run_compensation,
+    run_dynamic_mit,
     run_identify_all,
     run_inertia,
     run_speed_hold,
 )
 
-MODE_CHOICES = ("identify-all", "compensation", "breakaway", "speed-hold", "inertia")
+MODE_CHOICES = ("identify-all", "compensation", "breakaway", "speed-hold", "inertia", "dynamic-mit")
 
 
 def _default_config_argument() -> str:
@@ -62,6 +63,8 @@ def main(argv: list[str] | None = None) -> None:
             run_speed_hold(config, show_rerun_viewer=True)
         elif mode == "inertia":
             run_inertia(config, show_rerun_viewer=True)
+        elif mode == "dynamic-mit":
+            run_dynamic_mit(config, show_rerun_viewer=True)
         else:  # pragma: no cover
             raise ValueError(f"Unsupported mode: {mode}")
     except ValueError as exc:

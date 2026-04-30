@@ -10,7 +10,7 @@ from friction_identification_core.runtime_config import Config
 from send import damiao as send_damiao
 
 
-SemanticMode = Literal["mit_torque", "mit_velocity", "velocity_mode"]
+SemanticMode = Literal["mit_torque", "mit_velocity", "mit_state", "velocity_mode"]
 
 RECV_FRAME_HEAD = send_damiao.SERIALIZED_FEEDBACK_HEAD
 RECV_FRAME_FORMAT = send_damiao.SERIALIZED_FEEDBACK_FORMAT
@@ -105,6 +105,17 @@ class CommandTransport(Protocol):
         kp: float = 0.0,
         torque_ff: float = 0.0,
         position: float = 0.0,
+    ) -> bytes:
+        ...
+
+    def send_mit_state(
+        self,
+        motor_id: int,
+        position: float,
+        velocity: float,
+        kp: float,
+        kd: float,
+        torque_ff: float = 0.0,
     ) -> bytes:
         ...
 
