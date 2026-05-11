@@ -1,8 +1,0 @@
-motor_id,motor_name,round_count,accepted_round_count,tau_static,tau_static_std,tau_bias,tau_bias_std,tau_c,tau_c_std,viscous,viscous_std,inertia,inertia_std,friction_validation_rmse,inertia_validation_rmse,repeat_consistency_score,recommended_for_compensation,publish_status,publish_detail,selected_rounds,model_kind,source_phases
-1,motor_01,0,0,nan,nan,nan,nan,nan,nan,nan,nan,nan,nan,nan,nan,nan,False,not_run,,[],static_v1,[]
-2,motor_02,3,1,0.8150000000000001,0.0,-0.02524093763589213,0.0,0.436552877711512,0.0,0.011031131085857529,0.0,0.014928082395211208,0.0,0.016820804404538793,0.18213499204082884,0.0,False,not_published,"accepted_round_count=1, required=2; previous published model retained for reference",[3],static_v1,"['breakaway', 'speed-hold', 'inertia']"
-3,motor_03,0,0,nan,nan,nan,nan,nan,nan,nan,nan,nan,nan,nan,nan,nan,False,not_run,,[],static_v1,[]
-4,motor_04,0,0,nan,nan,nan,nan,nan,nan,nan,nan,nan,nan,nan,nan,nan,False,not_run,,[],static_v1,[]
-5,motor_05,0,0,nan,nan,nan,nan,nan,nan,nan,nan,nan,nan,nan,nan,nan,False,not_run,,[],static_v1,[]
-6,motor_06,0,0,nan,nan,nan,nan,nan,nan,nan,nan,nan,nan,nan,nan,nan,False,not_run,,[],static_v1,[]
-7,motor_07,0,0,nan,nan,nan,nan,nan,nan,nan,nan,nan,nan,nan,nan,nan,False,not_run,,[],static_v1,[]
