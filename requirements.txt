@@ -1,5 +1,4 @@
-numpy>=1.24.0
-scipy>=1.10.0
-pyserial>=3.5
-PyYAML>=6.0
-rerun-sdk>=0.27.0
+# Ubuntu 推荐用系统包安装 PyQt5：
+# sudo apt install -y python3-pyqt5 python3-pyqt5.qtserialport can-utils
+PyQt5>=5.15
+rerun-sdk>=0.27
