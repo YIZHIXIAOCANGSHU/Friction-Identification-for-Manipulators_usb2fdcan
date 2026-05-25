@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import unittest
 
-from send.damiao import (
+from mit_sender.commands import SelectedMotorCommand, build_uniform_commands
+from mit_sender.damiao import (
     CLEAR_ERROR_CMD,
     CONTROL_REPEAT,
     DISABLE_CMD,
@@ -17,7 +18,6 @@ from send.damiao import (
     decode_feedback_frame,
     default_motor_specs,
 )
-from mit_sender_gui import SelectedMotorCommand, build_uniform_commands
 
 
 class FakeCanTransport:
