@@ -90,7 +90,7 @@ class FeedbackRerunLogger:
         self._frame_count += 1
         rr = self._rr
         base_path = feedback_rerun_path(feedback.motor_id)
-        self._recording.set_time_seconds("feedback_time", float(elapsed_seconds))
+        _set_rerun_time_seconds(self._recording, "feedback_time", float(elapsed_seconds))
         self._recording.log(f"{base_path}/position", rr.Scalars([float(feedback.position)]))
         self._recording.log(f"{base_path}/velocity", rr.Scalars([float(feedback.velocity)]))
         self._recording.log(f"{base_path}/torque", rr.Scalars([float(feedback.torque)]))
@@ -126,3 +126,13 @@ class FeedbackRerunLogger:
         disconnect = getattr(self._recording, "disconnect", None)
         if callable(disconnect):
             disconnect()
+
+
+def _set_rerun_time_seconds(recording: object, timeline: str, seconds: float) -> None:
+    set_time = getattr(recording, "set_time", None)
+    if callable(set_time):
+        set_time(timeline, duration=float(seconds))
+        return
+    set_time_seconds = getattr(recording, "set_time_seconds", None)
+    if callable(set_time_seconds):
+        set_time_seconds(timeline, float(seconds))

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import unittest
+from unittest.mock import patch
 
 from mit_sender.commands import SelectedMotorCommand, build_uniform_commands
 from mit_sender.damiao import (
@@ -8,15 +9,26 @@ from mit_sender.damiao import (
     CONTROL_REPEAT,
     DISABLE_CMD,
     ENABLE_CMD,
+    MIT_MODE,
+    MIT_MODE_CODE,
+    PARAM_ESC_ID_RID,
+    PARAM_MST_ID_RID,
+    PARAM_CTRL_MODE_RID,
+    ZERO_POSITION_CMD,
     DM_Motor_Type,
     DamiaoMitController,
     MitCommand,
     MotorSpec,
     build_control_cmd_frame,
     build_mit_frame,
+    build_param_store_frame,
     build_param_write_frame,
+    build_param_write_uint32_frame,
+    build_zero_position_frame,
     decode_feedback_frame,
     default_motor_specs,
+    ensure_interface_ready,
+    format_can_setup_commands,
 )
 
 
@@ -62,7 +74,7 @@ class DamiaoMitSenderTests(unittest.TestCase):
         )
         self.assertEqual(
             transport.sent[CONTROL_REPEAT],
-            build_param_write_frame(0x01, 10, bytes([1, 0, 0, 0])),
+            build_param_write_frame(0x01, PARAM_CTRL_MODE_RID, bytes([MIT_MODE_CODE, 0, 0, 0])),
         )
         self.assertEqual(
             transport.sent[CONTROL_REPEAT + 1 : CONTROL_REPEAT * 2 + 1],
@@ -117,6 +129,116 @@ class DamiaoMitSenderTests(unittest.TestCase):
             ],
         )
 
+    def test_zero_position_frame_uses_control_command_payload(self) -> None:
+        self.assertEqual(
+            build_zero_position_frame(0x03, 0x100),
+            (0x103, bytes([0xFF] * 7 + [ZERO_POSITION_CMD])),
+        )
+
+    def test_param_write_uint32_frame_uses_little_endian_value(self) -> None:
+        self.assertEqual(
+            build_param_write_uint32_frame(0x01, PARAM_ESC_ID_RID, 0x03),
+            (0x7FF, bytes([0x01, 0x00, 0x55, PARAM_ESC_ID_RID, 0x03, 0x00, 0x00, 0x00])),
+        )
+
+    def test_build_param_store_frame_uses_flash_store_command(self) -> None:
+        self.assertEqual(
+            build_param_store_frame(0x20),
+            (0x7FF, bytes([0x20, 0x00, 0xAA, 0x01])),
+        )
+
+    def test_set_mit_mode_persistent_disables_writes_mode_then_stores(self) -> None:
+        transport = FakeCanTransport()
+        controller = DamiaoMitController(
+            transport,
+            [MotorSpec(motor_id=1, can_id=0x01, mst_id=0x11, motor_type=DM_Motor_Type.DM8009)],
+        )
+
+        controller.set_mit_mode_persistent_raw(0x01, MIT_MODE)
+
+        self.assertEqual(
+            transport.sent[:CONTROL_REPEAT],
+            [build_control_cmd_frame(0x01, DISABLE_CMD)] * CONTROL_REPEAT,
+        )
+        self.assertEqual(
+            transport.sent[CONTROL_REPEAT],
+            build_param_write_uint32_frame(0x01, PARAM_CTRL_MODE_RID, MIT_MODE_CODE),
+        )
+        self.assertEqual(
+            transport.sent[CONTROL_REPEAT + 1 : CONTROL_REPEAT * 2 + 1],
+            [build_control_cmd_frame(0x01, DISABLE_CMD)] * CONTROL_REPEAT,
+        )
+        self.assertEqual(transport.sent[CONTROL_REPEAT * 2 + 1], build_param_store_frame(0x01))
+
+    def test_set_motor_ids_persistent_disables_writes_ids_then_stores_new_id(self) -> None:
+        transport = FakeCanTransport()
+        controller = DamiaoMitController(
+            transport,
+            [MotorSpec(motor_id=1, can_id=0x01, mst_id=0x11, motor_type=DM_Motor_Type.DM8009)],
+        )
+
+        controller.set_motor_ids_persistent_raw(
+            current_can_id=0x01,
+            current_mode_offset=MIT_MODE,
+            new_can_id=0x20,
+            new_mst_id=0x30,
+        )
+
+        self.assertEqual(
+            transport.sent[:CONTROL_REPEAT],
+            [build_control_cmd_frame(0x01, DISABLE_CMD)] * CONTROL_REPEAT,
+        )
+        self.assertEqual(
+            transport.sent[CONTROL_REPEAT],
+            build_param_write_uint32_frame(0x01, PARAM_MST_ID_RID, 0x30),
+        )
+        self.assertEqual(
+            transport.sent[CONTROL_REPEAT + 1],
+            build_param_write_uint32_frame(0x01, PARAM_ESC_ID_RID, 0x20),
+        )
+        self.assertEqual(
+            transport.sent[CONTROL_REPEAT + 2 : CONTROL_REPEAT * 2 + 2],
+            [build_control_cmd_frame(0x20, DISABLE_CMD)] * CONTROL_REPEAT,
+        )
+        self.assertEqual(transport.sent[CONTROL_REPEAT * 2 + 2], build_param_store_frame(0x20))
+
+    def test_debug_configure_sequence_disables_then_sets_zero_mit_and_ids(self) -> None:
+        transport = FakeCanTransport()
+        controller = DamiaoMitController(
+            transport,
+            [MotorSpec(motor_id=1, can_id=0x01, mst_id=0x11, motor_type=DM_Motor_Type.DM8009)],
+        )
+
+        controller.configure_single_motor_raw(
+            current_can_id=0x01,
+            current_mode_offset=MIT_MODE,
+            new_can_id=0x03,
+            new_mst_id=0x13,
+        )
+
+        self.assertEqual(
+            transport.sent[:CONTROL_REPEAT],
+            [build_control_cmd_frame(0x01, DISABLE_CMD)] * CONTROL_REPEAT,
+        )
+        self.assertEqual(transport.sent[CONTROL_REPEAT], build_zero_position_frame(0x01, MIT_MODE))
+        self.assertEqual(
+            transport.sent[CONTROL_REPEAT + 1],
+            build_param_write_uint32_frame(0x01, PARAM_CTRL_MODE_RID, MIT_MODE_CODE),
+        )
+        self.assertEqual(
+            transport.sent[CONTROL_REPEAT + 2],
+            build_param_write_uint32_frame(0x01, PARAM_MST_ID_RID, 0x13),
+        )
+        self.assertEqual(
+            transport.sent[CONTROL_REPEAT + 3],
+            build_param_write_uint32_frame(0x01, PARAM_ESC_ID_RID, 0x03),
+        )
+        self.assertEqual(
+            transport.sent[CONTROL_REPEAT + 4 : CONTROL_REPEAT * 2 + 4],
+            [build_control_cmd_frame(0x03, DISABLE_CMD)] * CONTROL_REPEAT,
+        )
+        self.assertEqual(transport.sent[CONTROL_REPEAT * 2 + 4], build_param_store_frame(0x03))
+
     def test_decode_feedback_frame_maps_feedback_id_to_motor(self) -> None:
         frame = decode_feedback_frame(
             0x11,
@@ -135,6 +257,31 @@ class DamiaoMitSenderTests(unittest.TestCase):
         self.assertAlmostEqual(frame.torque, 0.0, delta=2e-2)
         self.assertAlmostEqual(frame.mos_temperature, 40.0, places=6)
         self.assertAlmostEqual(frame.rotor_temperature, 50.0, places=6)
+
+    def test_format_can_setup_commands_returns_three_manual_commands(self) -> None:
+        self.assertEqual(
+            format_can_setup_commands("can0", 1_000_000, 5_000_000),
+            "\n".join(
+                [
+                    "sudo ip link set can0 down",
+                    "sudo ip link set can0 type can bitrate 1000000 dbitrate 5000000 fd on",
+                    "sudo ip link set can0 up",
+                ]
+            ),
+        )
+
+    def test_missing_can_interface_error_lists_available_interfaces(self) -> None:
+        with (
+            patch("mit_sender.damiao.get_can_interface_state", return_value=None),
+            patch("mit_sender.damiao.list_available_can_interfaces", return_value=("can0", "can1")),
+        ):
+            with self.assertRaises(RuntimeError) as error:
+                ensure_interface_ready("can2", 1_000_000, 5_000_000)
+
+        message = str(error.exception)
+        self.assertIn("CAN interface can2 does not exist", message)
+        self.assertIn("检测到: can0, can1", message)
+        self.assertIn("sudo ip link set can2 down", message)
 
 
 if __name__ == "__main__":

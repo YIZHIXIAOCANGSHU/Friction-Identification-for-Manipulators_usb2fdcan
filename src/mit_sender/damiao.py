@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import errno
+import glob
 import math
 import os
 import select
@@ -21,9 +22,18 @@ CANFD_BRS = getattr(socket, "CANFD_BRS", 0x01)
 CLEAR_ERROR_CMD = 0xFB
 ENABLE_CMD = 0xFC
 DISABLE_CMD = 0xFD
+ZERO_POSITION_CMD = 0xFE
 MIT_MODE = 0x000
 MIT_MODE_CODE = 1
 
+PARAM_MST_ID_RID = 7
+PARAM_ESC_ID_RID = 8
+PARAM_CTRL_MODE_RID = 10
+PARAM_WRITE_CMD = 0x55
+PARAM_STORE_CMD = 0xAA
+PARAM_STORE_TO_FLASH = 0x01
+
+ALLOWED_INTERFACES = ("can0", "can1")
 DEFAULT_INTERFACE = "can0"
 DEFAULT_NOMINAL_BITRATE = 1_000_000
 DEFAULT_DATA_BITRATE = 5_000_000
@@ -34,6 +44,7 @@ DEFAULT_MOTOR_TYPES = ("DM8009", "DM8009", "DM4340", "DM4340", "DM4310", "DM4310
 CONTROL_REPEAT = 5
 CONTROL_INTERVAL_SECONDS = 0.002
 PARAM_WRITE_SETTLE_SECONDS = 0.002
+PARAM_STORE_SETTLE_SECONDS = 0.05
 BACKPRESSURE_SLEEP_SECONDS = 0.0005
 MAX_BACKPRESSURE_SLEEP_SECONDS = 0.01
 
@@ -184,7 +195,29 @@ def build_control_cmd_frame(can_id: int, cmd: int) -> tuple[int, bytes]:
 def build_param_write_frame(can_id: int, rid: int, data: bytes) -> tuple[int, bytes]:
     if len(data) != 4:
         raise ValueError("Motor parameter writes require exactly 4 data bytes")
-    return 0x7FF, bytes([can_id & 0xFF, (can_id >> 8) & 0xFF, 0x55, rid, *data])
+    return 0x7FF, bytes([can_id & 0xFF, (can_id >> 8) & 0xFF, PARAM_WRITE_CMD, rid, *data])
+
+
+def build_param_write_uint32_frame(can_id: int, rid: int, value: int) -> tuple[int, bytes]:
+    if int(value) < 0:
+        raise ValueError("Motor uint32 parameter writes must be >= 0")
+    return build_param_write_frame(can_id, rid, int(value).to_bytes(4, byteorder="little", signed=False))
+
+
+def build_param_store_frame(can_id: int) -> tuple[int, bytes]:
+    _validate_standard_can_id(can_id, "can_id")
+    return 0x7FF, bytes(
+        [
+            int(can_id) & 0xFF,
+            (int(can_id) >> 8) & 0xFF,
+            PARAM_STORE_CMD,
+            PARAM_STORE_TO_FLASH,
+        ]
+    )
+
+
+def build_zero_position_frame(can_id: int, mode_offset: int = MIT_MODE) -> tuple[int, bytes]:
+    return build_control_cmd_frame(int(can_id) + int(mode_offset), ZERO_POSITION_CMD)
 
 
 def build_mit_frame(
@@ -310,9 +343,7 @@ class DamiaoMitController:
 
     def set_mit_mode(self, motor_id: int) -> None:
         spec = self._spec(motor_id)
-        can_id, payload = build_param_write_frame(spec.can_id, 10, bytes([MIT_MODE_CODE, 0, 0, 0]))
-        send_frame(self.transport, can_id, payload)
-        time.sleep(PARAM_WRITE_SETTLE_SECONDS)
+        self.set_mit_mode_raw(spec.can_id)
 
     def clear_error(self, motor_id: int) -> None:
         self._send_control(motor_id, CLEAR_ERROR_CMD)
@@ -325,6 +356,67 @@ class DamiaoMitController:
     def disable_motor(self, motor_id: int) -> None:
         self._send_control(motor_id, DISABLE_CMD)
         self.enabled_motor_ids.discard(int(motor_id))
+
+    def save_zero_position(self, motor_id: int) -> None:
+        spec = self._spec(motor_id)
+        self.save_zero_position_raw(spec.can_id, MIT_MODE)
+
+    def save_zero_position_raw(self, can_id: int, mode_offset: int = MIT_MODE) -> None:
+        frame_can_id, payload = build_zero_position_frame(int(can_id), int(mode_offset))
+        send_frame(self.transport, frame_can_id, payload)
+        time.sleep(CONTROL_INTERVAL_SECONDS)
+
+    def set_mit_mode_raw(self, can_id: int) -> None:
+        frame_can_id, payload = build_param_write_uint32_frame(int(can_id), PARAM_CTRL_MODE_RID, MIT_MODE_CODE)
+        send_frame(self.transport, frame_can_id, payload)
+        time.sleep(PARAM_WRITE_SETTLE_SECONDS)
+
+    def store_parameters_raw(self, can_id: int, mode_offset: int = MIT_MODE) -> None:
+        self._send_control_raw(int(can_id), int(mode_offset), DISABLE_CMD)
+        frame_can_id, payload = build_param_store_frame(int(can_id))
+        send_frame(self.transport, frame_can_id, payload)
+        time.sleep(PARAM_STORE_SETTLE_SECONDS)
+
+    def set_mit_mode_persistent_raw(self, can_id: int, mode_offset: int = MIT_MODE) -> None:
+        self._send_control_raw(int(can_id), int(mode_offset), DISABLE_CMD)
+        self.set_mit_mode_raw(int(can_id))
+        self.store_parameters_raw(int(can_id), MIT_MODE)
+
+    def set_motor_ids_raw(self, current_can_id: int, new_can_id: int, new_mst_id: int) -> None:
+        for label, value in (("current_can_id", current_can_id), ("new_can_id", new_can_id), ("new_mst_id", new_mst_id)):
+            _validate_standard_can_id(value, label)
+        # Write feedback ID first because writing ESC_ID changes the address used for further parameter writes.
+        for rid, value in ((PARAM_MST_ID_RID, new_mst_id), (PARAM_ESC_ID_RID, new_can_id)):
+            frame_can_id, payload = build_param_write_uint32_frame(int(current_can_id), rid, int(value))
+            send_frame(self.transport, frame_can_id, payload)
+            time.sleep(PARAM_WRITE_SETTLE_SECONDS)
+
+    def set_motor_ids_persistent_raw(
+        self,
+        current_can_id: int,
+        current_mode_offset: int,
+        new_can_id: int,
+        new_mst_id: int,
+    ) -> None:
+        self._send_control_raw(int(current_can_id), int(current_mode_offset), DISABLE_CMD)
+        self.set_motor_ids_raw(int(current_can_id), int(new_can_id), int(new_mst_id))
+        self.store_parameters_raw(int(new_can_id), MIT_MODE)
+
+    def configure_single_motor_raw(
+        self,
+        current_can_id: int,
+        current_mode_offset: int,
+        new_can_id: int,
+        new_mst_id: int,
+    ) -> None:
+        _validate_standard_can_id(current_can_id, "current_can_id")
+        _validate_standard_can_id(new_can_id, "new_can_id")
+        _validate_standard_can_id(new_mst_id, "new_mst_id")
+        self._send_control_raw(int(current_can_id), int(current_mode_offset), DISABLE_CMD)
+        self.save_zero_position_raw(int(current_can_id), int(current_mode_offset))
+        self.set_mit_mode_raw(int(current_can_id))
+        self.set_motor_ids_raw(int(current_can_id), int(new_can_id), int(new_mst_id))
+        self.store_parameters_raw(int(new_can_id), MIT_MODE)
 
     def prepare_motor(self, motor_id: int) -> None:
         self.clear_error(motor_id)
@@ -353,9 +445,12 @@ class DamiaoMitController:
 
     def _send_control(self, motor_id: int, cmd: int) -> None:
         spec = self._spec(motor_id)
-        can_id, payload = build_control_cmd_frame(spec.can_id + MIT_MODE, cmd)
+        self._send_control_raw(spec.can_id, MIT_MODE, cmd)
+
+    def _send_control_raw(self, can_id: int, mode_offset: int, cmd: int) -> None:
+        frame_can_id, payload = build_control_cmd_frame(int(can_id) + int(mode_offset), cmd)
         for _ in range(CONTROL_REPEAT):
-            send_frame(self.transport, can_id, payload)
+            send_frame(self.transport, frame_can_id, payload)
             time.sleep(CONTROL_INTERVAL_SECONDS)
 
     def _spec(self, motor_id: int) -> MotorSpec:
@@ -364,6 +459,11 @@ class DamiaoMitController:
         except KeyError as exc:
             valid_ids = ", ".join(str(key) for key in sorted(self.motor_specs))
             raise ValueError(f"Unknown motor id {motor_id}; valid ids: {valid_ids}") from exc
+
+
+def _validate_standard_can_id(value: int, label: str = "can_id") -> None:
+    if int(value) < 0x001 or int(value) > 0x7FE:
+        raise ValueError(f"{label} must be within 0x001..0x7FE")
 
 
 def configure_can_interface(
@@ -393,27 +493,66 @@ def configure_can_interface(
         subprocess.run(command, check=True)
 
 
+def format_can_setup_commands(
+    interface: str,
+    nominal_bitrate: int = DEFAULT_NOMINAL_BITRATE,
+    data_bitrate: int = DEFAULT_DATA_BITRATE,
+) -> str:
+    return "\n".join(
+        [
+            f"sudo ip link set {interface} down",
+            f"sudo ip link set {interface} type can bitrate {int(nominal_bitrate)} dbitrate {int(data_bitrate)} fd on",
+            f"sudo ip link set {interface} up",
+        ]
+    )
+
+
+def can_setup_hint(
+    interface: str,
+    nominal_bitrate: int = DEFAULT_NOMINAL_BITRATE,
+    data_bitrate: int = DEFAULT_DATA_BITRATE,
+) -> str:
+    return "可手动执行以下三行命令:\n" + format_can_setup_commands(interface, nominal_bitrate, data_bitrate)
+
+
+def get_can_interface_state(interface: str) -> str | None:
+    state_path = f"/sys/class/net/{interface}/operstate"
+    if not os.path.exists(state_path):
+        return None
+    with open(state_path, "r", encoding="utf-8") as file:
+        return file.read().strip()
+
+
+def list_available_can_interfaces() -> tuple[str, ...]:
+    return tuple(sorted(os.path.basename(path) for path in glob.glob("/sys/class/net/can*")))
+
+
+def format_available_can_interfaces() -> str:
+    interfaces = list_available_can_interfaces()
+    return "检测到: " + (", ".join(interfaces) if interfaces else "无")
+
+
 def ensure_interface_ready(
     interface: str,
     nominal_bitrate: int = DEFAULT_NOMINAL_BITRATE,
     data_bitrate: int = DEFAULT_DATA_BITRATE,
 ) -> None:
-    state_path = f"/sys/class/net/{interface}/operstate"
-    if not os.path.exists(state_path):
-        raise RuntimeError(f"CAN interface {interface} does not exist")
-    with open(state_path, "r", encoding="utf-8") as file:
-        state = file.read().strip()
+    state = get_can_interface_state(interface)
+    if state is None:
+        raise RuntimeError(
+            f"CAN interface {interface} does not exist\n"
+            f"{format_available_can_interfaces()}\n"
+            f"{can_setup_hint(interface, nominal_bitrate, data_bitrate)}"
+        )
     if state != "up":
         raise RuntimeError(
-            f"{interface} is not UP. Run:\n"
-            f"  sudo ip link set {interface} down\n"
-            f"  sudo ip link set {interface} type can bitrate {nominal_bitrate} dbitrate {data_bitrate} fd on\n"
-            f"  sudo ip link set {interface} up"
+            f"{interface} is not UP.\n{can_setup_hint(interface, nominal_bitrate, data_bitrate)}"
         )
 
 
 __all__ = [
     "CANFD_BRS",
+    "ALLOWED_INTERFACES",
     "CLEAR_ERROR_CMD",
     "CONTROL_REPEAT",
     "DEFAULT_DATA_BITRATE",
@@ -431,16 +570,31 @@ __all__ = [
     "MotorFeedback",
     "MotorLimits",
     "MotorSpec",
+    "PARAM_CTRL_MODE_RID",
+    "PARAM_ESC_ID_RID",
+    "PARAM_MST_ID_RID",
+    "PARAM_STORE_CMD",
+    "PARAM_STORE_SETTLE_SECONDS",
+    "PARAM_STORE_TO_FLASH",
+    "PARAM_WRITE_CMD",
     "SocketCanTransport",
+    "ZERO_POSITION_CMD",
     "build_control_cmd_frame",
     "build_mit_frame",
+    "build_param_store_frame",
     "build_param_write_frame",
+    "build_param_write_uint32_frame",
+    "build_zero_position_frame",
     "configure_can_interface",
     "decode_feedback_frame",
     "default_motor_specs",
     "ensure_interface_ready",
+    "format_available_can_interfaces",
+    "format_can_setup_commands",
     "float_to_uint",
+    "get_can_interface_state",
     "get_motor_limits",
+    "list_available_can_interfaces",
     "pack_canfd_frame",
     "parse_motor_type",
     "send_frame",

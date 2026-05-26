@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from mit_sender.damiao import MitCommand
+from mit_sender.damiao import MIT_MODE, MitCommand
 
 
 MIT_COMMAND_DEFAULTS = {
@@ -28,6 +28,16 @@ MIT_FIELD_TOOLTIPS = {
     "kd": "kd: 速度增益，范围 0..5",
     "torque_ff": "torque_ff: 前馈力矩",
 }
+
+POSITION_VELOCITY_MODE = 0x100
+VELOCITY_MODE = 0x200
+DEBUG_MODE_OPTIONS = (
+    ("MIT", MIT_MODE),
+    ("位置速度", POSITION_VELOCITY_MODE),
+    ("速度", VELOCITY_MODE),
+)
+DEBUG_MODE_OFFSETS = tuple(offset for _label, offset in DEBUG_MODE_OPTIONS)
+DEFAULT_DEBUG_FEEDBACK_OFFSET = 0x10
 
 
 @dataclass(frozen=True)
@@ -55,6 +65,24 @@ class TransportSettings:
     nominal_bitrate: int
     data_bitrate: int
     configure_interface: bool
+
+
+@dataclass(frozen=True)
+class SingleMotorDebugCommand:
+    current_can_id: int
+    current_mode_offset: int
+    new_can_id: int
+    new_mst_id: int
+
+
+def default_single_motor_debug_command() -> SingleMotorDebugCommand:
+    default_can_id = 0x01
+    return SingleMotorDebugCommand(
+        current_can_id=default_can_id,
+        current_mode_offset=MIT_MODE,
+        new_can_id=default_can_id,
+        new_mst_id=default_can_id + DEFAULT_DEBUG_FEEDBACK_OFFSET,
+    )
 
 
 def build_uniform_commands(
